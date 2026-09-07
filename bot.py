@@ -6,6 +6,9 @@ import logging
 import subprocess
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 logging.basicConfig(level=logging.INFO)
 
@@ -17,17 +20,16 @@ dp = Dispatcher()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+class VideoConfig(StatesGroup):
+    waiting_for_config = State()
 
 def generate_progress_bar(percent: int) -> str:
-    """ساخت ظاهر گرافیکی درصد پیشرفت با کاراکترهای یونیکد"""
-    total_blocks = 10
+    """نوار پیشرفت کلاسیک و بدون ایموجی"""
     filled = int(round(percent / 10))
-    bar = "🟩" * filled + "⬜" * (total_blocks - filled)
-    return f"{bar} {percent}%"
-
+    bar = "█" * filled + "▒" * (10 - filled)
+    return f"[{bar}] {percent}%"
 
 async def get_video_duration(file_path: str) -> float:
-    """دریافت دقیق طول مدت زمان ویدیو از طریق ffprobe"""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -35,78 +37,86 @@ async def get_video_duration(file_path: str) -> float:
         file_path
     ]
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         return float(stdout.decode().strip())
     except Exception:
         return 0.0
 
-
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
     await message.answer(
-        "🎬 **به ربات DarkPress Video Optimizer خوش آمدید!**\n\n"
-        "⚡ برای فشرده‌سازی خودکار و حفظ رزولوشن، کافیست ویدیوی خود را (حداکثر ۵۰ مگابایت) بفرستید.\n"
-        "🔧 خروجی با کدک استاندارد `H.264` و متادیتای `faststart` بهینه‌سازی خواهد شد."
+        "به ربات فشرده‌ساز خوش آمدید.\n\n"
+        "جهت شروع، ویدیوی خود را (حداکثر ۵۰ مگابایت) ارسال کنید تا گزینه‌های پردازش نمایش داده شوند."
     )
-
 
 @dp.message(F.video | F.document)
-async def handle_video(message: types.Message):
-    video = message.video or (
-        message.document
-        if message.document and message.document.mime_type and message.document.mime_type.startswith("video/")
-        else None
+async def handle_video(message: types.Message, state: FSMContext):
+    video = message.video or (message.document if message.document and message.document.mime_type and message.document.mime_type.startswith("video/") else None)
+    
+    if not video:
+        return await message.answer("فرمت فایل نامعتبر است. لطفاً یک ویدیو ارسال کنید.")
+    if video.file_size > 50 * 1024 * 1024:
+        return await message.answer("حجم ویدیو بیشتر از سقف مجاز (۵۰ مگابایت) است.")
+
+    # ذخیره اطلاعات فایل در State
+    await state.update_data(file_id=video.file_id, msg_id=message.message_id, file_size=video.file_size)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Original", callback_data="process_orig_h264")
+    builder.button(text="1080p", callback_data="process_1080_h264")
+    builder.button(text="720p", callback_data="process_720_h264")
+    builder.button(text="480p", callback_data="process_480_h264")
+    builder.button(text="720p (H.265/HEVC)", callback_data="process_720_h265")
+    builder.adjust(2, 2, 1)
+
+    await message.answer(
+        "تنظیمات خروجی را انتخاب کنید:",
+        reply_markup=builder.as_markup()
     )
 
-    if not video:
-        await message.answer("⚠️ لطفاً یک فایل ویدیویی ارسال کنید.")
-        return
-
-    if video.file_size > 50 * 1024 * 1024:
-        await message.answer("❌ **خطای محدودیت حجم:** حجم ویدیو بیشتر از سقف ۵۰ مگابایت سرور اصلی است.")
-        return
-
-    status_msg = await message.answer("📥 **در حال دریافت فایل از تلگرام...**\n" + generate_progress_bar(0))
-
-    input_path = os.path.join(DOWNLOAD_DIR, f"input_{message.message_id}.mp4")
-    output_path = os.path.join(DOWNLOAD_DIR, f"compressed_{message.message_id}.mp4")
+@dp.callback_query(F.data.startswith("process_"))
+async def process_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("file_id"):
+        return await callback.message.edit_text("نشست منقضی شده است. لطفاً ویدیو را مجدداً ارسال کنید.")
+    
+    await state.clear()
+    
+    _, res, codec_type = callback.data.split("_")
+    file_id = data["file_id"]
+    msg_id = data["msg_id"]
+    initial_size = data["file_size"]
+    
+    status_msg = await callback.message.edit_text("در حال بارگیری از سرور...\n" + generate_progress_bar(0))
+    
+    input_path = os.path.join(DOWNLOAD_DIR, f"in_{msg_id}.mp4")
+    output_path = os.path.join(DOWNLOAD_DIR, f"out_{msg_id}.mp4")
 
     try:
-        # مرحله اول: دانلود
-        file_info = await bot.get_file(video.file_id)
+        # مرحله دانلود
+        file_info = await bot.get_file(file_id)
         await bot.download_file(file_info.file_path, destination=input_path)
 
-        # دریافت مدت زمان فایل برای محاسبه زنده FFmpeg
         total_duration = await get_video_duration(input_path)
+        await status_msg.edit_text("آماده‌سازی موتور پردازش...\n" + generate_progress_bar(0))
 
-        await status_msg.edit_text("⚙️ **شروع پردازش و کاهش حجم ویدیو...**\n" + generate_progress_bar(0))
-
-        # مرحله دوم: پردازش و فشرده‌سازی FFmpeg
+        # تنظیمات FFmpeg بر اساس انتخاب کاربر
+        codec = "libx265" if codec_type == "h265" else "libx264"
         cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-c:v", "libx264",
-            "-crf", "28",
-            "-preset", "faster",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            output_path
+            "ffmpeg", "-y", "-i", input_path,
+            "-c:v", codec, "-crf", "28", "-preset", "faster",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k"
         ]
+        
+        if res != "orig":
+            cmd.extend(["-vf", f"scale=-2:{res}"])
+            
+        cmd.append(output_path)
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # حلقه خواندن خروجی FFmpeg برای ساخت نوار پیشرفت زنده
         last_update_time = time.time()
         time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
 
@@ -114,75 +124,56 @@ async def handle_video(message: types.Message):
             line = await process.stderr.readline()
             if not line:
                 break
-
+            
             decoded_line = line.decode(errors="ignore")
             match = time_pattern.search(decoded_line)
-
+            
             if match and total_duration > 0:
-                hours, minutes, seconds = map(float, match.groups())
-                current_time = hours * 3600 + minutes * 60 + seconds
+                h, m, s = map(float, match.groups())
+                current_time = h * 3600 + m * 60 + s
                 percent = min(100, int((current_time / total_duration) * 100))
 
-                # تلگرام محدودیت ادیت پیام دارد؛ ویرایش را روی هر ۲ ثانیه کنترل می‌کنیم
                 if time.time() - last_update_time > 2.0:
                     try:
-                        await status_msg.edit_text(
-                            f"⚙️ **درحال فشرده‌سازی:**\n{generate_progress_bar(percent)}"
-                        )
+                        await status_msg.edit_text(f"در حال پردازش:\n{generate_progress_bar(percent)}")
                         last_update_time = time.time()
-                    except Exception:
-                        pass
+                    except: pass
 
         await process.wait()
 
-        # تأیید سلامت فایل خروجی
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            await status_msg.edit_text("❌ خطا: فایل خروجی خراب شد یا پردازش با شکست مواجه گردید.")
-            return
+            return await status_msg.edit_text("خطا: پردازش متوقف شد. فایل نامعتبر است.")
 
-        await status_msg.edit_text("📤 **در حال بارگذاری فایل نهایی در تلگرام...**")
+        await status_msg.edit_text("پردازش موفق. در حال آپلود...")
 
-        initial_size_mb = video.file_size / (1024 * 1024)
-        compressed_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        reduction_rate = max(0, int(((initial_size_mb - compressed_size_mb) / initial_size_mb) * 100))
+        final_size = os.path.getsize(output_path)
+        reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        caption_text = (
-            "✅ **پردازش با موفقیت انجام شد!**\n\n"
-            f"📊 **حجم اولیه:** `{initial_size_mb:.2f} MB`\n"
-            f"📉 **حجم بهینه‌شده:** `{compressed_size_mb:.2f} MB`\n"
-            f"🚀 **میزان کاهش:** `{reduction_rate}%`"
+        caption = (
+            f"عملیات پایان یافت.\n\n"
+            f"حجم اصلی: {initial_size / (1024*1024):.2f} MB\n"
+            f"حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
+            f"صرفه‌جویی: {reduction}%"
         )
 
-        compressed_file = types.FSInputFile(
-            output_path,
-            filename=f"compressed_{message.message_id}.mp4"
-        )
-
-        await message.answer_video(
+        compressed_file = types.FSInputFile(output_path, filename=f"video_{msg_id}.mp4")
+        await bot.send_video(
+            chat_id=callback.message.chat.id,
             video=compressed_file,
-            caption=caption_text,
+            caption=caption,
             supports_streaming=True
         )
-
         await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await status_msg.edit_text(f"⚠️ خطایی رخ داد:\n`{e}`")
-
+        await status_msg.edit_text(f"خطای سیستمی:\n{e}")
     finally:
-        # پاک‌سازی فایل‌های موقت هارد سرور
-        if os.path.exists(input_path):
-            os.remove(input_path)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
+        if os.path.exists(input_path): os.remove(input_path)
+        if os.path.exists(output_path): os.remove(output_path)
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    print("Bot is up and running on official servers.")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
