@@ -7,38 +7,35 @@ import asyncio
 import logging
 import subprocess
 
-# نصب خودکار پکیج‌های پایتونی در صورت عدم وجود روی محیط
-def ensure_packages():
-    required_packages = ["aiogram"]
-    for pkg in required_packages:
+# نصب و تأمین خودکار پکیج‌ها و باینری FFmpeg
+def setup_dependencies():
+    packages = ["aiogram", "imageio-ffmpeg"]
+    for pkg in packages:
         try:
-            __import__(pkg)
+            __import__(pkg.replace("-", "_"))
         except ImportError:
-            print(f"📦 در حال نصب پکیج {pkg}...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
-ensure_packages()
+setup_dependencies()
 
+import imageio_ffmpeg
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import FSInputFile
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# آدرس فایل باینری کامپایل‌شده FFmpeg
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
-# توکن و آیدی ادمین با مقادیر پیش‌فرض
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8812733722:AAEFW8oxPPQYyqrqHGtnvS8fTpu3ATxcDbo")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6616272875"))
 
-# سقف دانلود سرور استاندارد تلگرام
 MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024
 MAX_UPLOAD_SIZE = int(48.5 * 1024 * 1024)
 
-# کنترل همزمانی برای جلوگیری از کرش سرور
 MAX_CONCURRENT_TASKS = 2
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -61,23 +58,21 @@ def generate_progress_bar(percent: float) -> str:
 
 
 async def get_video_duration(file_path: str) -> float:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        file_path
-    ]
+    cmd = [FFMPEG_BIN, "-i", file_path]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
-        val = stdout.decode().strip()
-        return float(val) if val else 0.0
+        _, stderr = await proc.communicate()
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr.decode(errors="ignore"))
+        if match:
+            h, m, s = map(float, match.groups())
+            return h * 3600 + m * 60 + s
+        return 0.0
     except Exception as e:
-        logging.warning(f"FFprobe execution failed: {e}")
+        logging.warning(f"Failed to detect video duration: {e}")
         return 0.0
 
 
@@ -109,7 +104,7 @@ def get_cancel_keyboard(task_id: str):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("🎬 ویدیوی خود را (حداکثر ۲۰ مگابایت) بفرستید تا تنظیمات فشرده‌سازی باز شود.")
+    await message.answer("🎬 ویدیوی خود را (حداکثر ۲۰ مگابایت) ارسال کنید.")
 
 
 @dp.message(F.video | F.document)
@@ -125,7 +120,7 @@ async def handle_video(message: types.Message):
 
     if video.file_size > MAX_DOWNLOAD_SIZE:
         return await message.answer(
-            f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف مجاز بات‌های تلگرام (۲۰ مگابایت) بیشتر است."
+            f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف مجاز بات (۲۰ مگابایت) بیشتر است."
         )
 
     task_id = uuid.uuid4().hex[:8]
@@ -156,9 +151,6 @@ async def update_config(callback: types.CallbackQuery):
     await callback.answer()
     _, task_id, res, codec = callback.data.split(":")
 
-    if task_id not in TASK_STORAGE:
-        return await callback.message.edit_text("⚠️ این جلسه منقضی شده است.")
-
     try:
         await callback.message.edit_reply_markup(
             reply_markup=get_config_keyboard(task_id, res, codec)
@@ -179,9 +171,9 @@ async def stop_processing(callback: types.CallbackQuery):
             except ProcessLookupError:
                 pass
         await callback.answer("عملیات متوقف شد.")
-        await callback.message.edit_text("🛑 پردازش لغو شد.")
+        await callback.message.edit_text("🛑 پردازش توسط شما متوقف شد.")
     else:
-        await callback.answer("پردازش قبلاً لغو یا تکمیل شده است.", show_alert=True)
+        await callback.answer("پردازش قبلاً لغو یا تمام شده است.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("run:"))
@@ -189,16 +181,28 @@ async def start_process(callback: types.CallbackQuery):
     await callback.answer()
     _, task_id, res, codec = callback.data.split(":")
 
-    if task_id not in TASK_STORAGE:
-        return await callback.message.edit_text("❌ نشست نامعتبر است. لطفاً فایل را مجدد ارسال فرمایید.")
+    file_id = None
+    initial_size = 0
+    user = callback.from_user
 
-    task_data = TASK_STORAGE.pop(task_id)
-    file_id = task_data["file_id"]
-    initial_size = task_data["file_size"]
-    user = task_data["user"]
+    # در صورت ریستارت کانتینر، دیتا از پیام اصلی بازیابی می‌شود
+    if task_id in TASK_STORAGE:
+        task_data = TASK_STORAGE.pop(task_id)
+        file_id = task_data["file_id"]
+        initial_size = task_data["file_size"]
+        user = task_data["user"]
+    elif callback.message.reply_to_message:
+        orig = callback.message.reply_to_message
+        target = orig.video or (orig.document if orig.document and orig.document.mime_type and orig.document.mime_type.startswith("video/") else None)
+        if target:
+            file_id = target.file_id
+            initial_size = target.file_size
+
+    if not file_id:
+        return await callback.message.edit_text("❌ فایل پیدا نشد. لطفاً مجدداً ویدیو را بفرستید.")
 
     status_msg = await callback.message.edit_text(
-        "⏳ در صف انتظار پردازش...",
+        "⏳ در صف انتظار پردازش سرور...",
         reply_markup=get_cancel_keyboard(task_id)
     )
 
@@ -213,7 +217,7 @@ async def start_process(callback: types.CallbackQuery):
             return
 
         try:
-            await status_msg.edit_text("📥 در حال دریافت فایل از تلگرام...", reply_markup=get_cancel_keyboard(task_id))
+            await status_msg.edit_text("📥 در حال دانلود از تلگرام...", reply_markup=get_cancel_keyboard(task_id))
             file_info = await bot.get_file(file_id)
             await bot.download_file(file_info.file_path, destination=input_path)
 
@@ -221,13 +225,13 @@ async def start_process(callback: types.CallbackQuery):
                 return
 
             total_duration = await get_video_duration(input_path)
-            await status_msg.edit_text("🔧 در حال پردازش...", reply_markup=get_cancel_keyboard(task_id))
+            await status_msg.edit_text("🔧 آماده‌سازی اینکودر...", reply_markup=get_cancel_keyboard(task_id))
 
             v_codec = "libx265" if codec == "h265" else "libx264"
             scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2" if res == "orig" else f"scale=-2:{res}"
 
             cmd = [
-                "ffmpeg", "-y", "-i", input_path,
+                FFMPEG_BIN, "-y", "-i", input_path,
                 "-map", "0:v:0", "-map", "0:a:0?",
                 "-c:v", v_codec,
                 "-vf", scale_filter,
@@ -277,18 +281,17 @@ async def start_process(callback: types.CallbackQuery):
                 return
 
             if process.returncode != 0 or not os.path.exists(output_path):
-                return await status_msg.edit_text("❌ خطا در تبدیل ویدیو. بررسی کنید FFmpeg روی هاست نصب باشد.")
+                return await status_msg.edit_text("❌ خطا در فرآیند تبدیل فایل.")
 
             final_size = os.path.getsize(output_path)
 
-            # فشرده‌سازی دو مرحله‌ای در صورت بزرگ بودن حجم نهایی
             if final_size > MAX_UPLOAD_SIZE and total_duration > 0:
-                await status_msg.edit_text("⚠️ تنظیم مجدد بیت‌ریت جهت رعایت سقف آپلود...")
+                await status_msg.edit_text("⚠️ تنظیم مجدد بیت‌ریت جهت تطابق با سقف تلگرام...")
                 target_total_bits = 45 * 8 * 1024 * 1024
                 target_bitrate = max(100, int((target_total_bits / total_duration) / 1000) - 96)
 
                 re_cmd = [
-                    "ffmpeg", "-y", "-i", output_path,
+                    FFMPEG_BIN, "-y", "-i", output_path,
                     "-c:v", v_codec,
                     "-b:v", f"{target_bitrate}k",
                     "-maxrate", f"{int(target_bitrate * 1.2)}k",
@@ -311,7 +314,7 @@ async def start_process(callback: types.CallbackQuery):
                     final_size = os.path.getsize(output_path)
 
             if final_size > MAX_UPLOAD_SIZE:
-                return await status_msg.edit_text("❌ حجم نهایی ویدیو بیشتر از سقف مجاز تلگرام است.")
+                return await status_msg.edit_text("❌ حجم نهایی ویدیو بیش از ۴۸.۵ مگابایت شد و تلگرام اجازه آپلود آن را نمی‌دهد.")
 
             reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
             await status_msg.edit_text("📤 در حال آپلود...")
@@ -329,13 +332,12 @@ async def start_process(callback: types.CallbackQuery):
             )
             await status_msg.delete()
 
-            # ارسال گزارش برای ادمین
             if ADMIN_ID and user.id != ADMIN_ID:
                 username = f"@{user.username}" if user.username else "ندارد"
                 admin_text = (
                     f"🔔 **گزارش تبدیل ویدیو**\n\n"
                     f"👤 کاربر: {user.full_name} ({username}) | `{user.id}`\n"
-                    f"⚙️ تنظیمات: {res} | {codec}\n"
+                    f"⚙️ کیفیت: {res} | کدک: {codec}\n"
                     f"📉 نتیجه: `{initial_size / (1024*1024):.2f} MB` ➔ `{final_size / (1024*1024):.2f} MB` ({reduction}%)"
                 )
                 admin_kb = InlineKeyboardBuilder()
@@ -346,12 +348,12 @@ async def start_process(callback: types.CallbackQuery):
                 try:
                     await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_kb.as_markup())
                 except Exception as ex:
-                    logging.warning(f"ارسال به ادمین با خطا مواجه شد: {ex}")
+                    logging.warning(f"Error sending log to admin: {ex}")
 
         except Exception as e:
-            logging.error(f"خطا در پردازش: {e}", exc_info=True)
+            logging.error(f"Error during video processing: {e}", exc_info=True)
             if not ACTIVE_PROCESSES.get(task_id, {}).get("cancelled"):
-                await status_msg.edit_text(f"⚠️ خطایی در سرور رخ داد:\n`{e}`")
+                await status_msg.edit_text(f"⚠️ خطای غیرمنتظره:\n`{e}`")
         finally:
             ACTIVE_PROCESSES.pop(task_id, None)
             for path in (input_path, output_path, re_output_path):
@@ -376,12 +378,12 @@ async def admin_get_video(callback: types.CallbackQuery):
         )
         await callback.answer("✅ ویدیو فوروارد شد.")
     except Exception:
-        await callback.answer("❌ پیام در چت مبدا حذف شده است.", show_alert=True)
+        await callback.answer("❌ پیام در چت کاربر حذف شده است.", show_alert=True)
 
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("ربات با موفقیت فعال شد.")
+    logging.info("ربات در Railway با موفقیت راه‌اندازی شد.")
     await dp.start_polling(bot)
 
 
