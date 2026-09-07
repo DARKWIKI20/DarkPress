@@ -6,7 +6,7 @@ import asyncio
 import logging
 import subprocess
 
-# نصب خودکار پکیج‌ها و باینری FFmpeg
+# نصب و تأمین خودکار پکیج‌ها و باینری مستقل FFmpeg
 def setup_dependencies():
     packages = ["aiogram", "imageio-ffmpeg"]
     for pkg in packages:
@@ -69,7 +69,7 @@ async def get_video_duration(file_path: str) -> float:
         return 0.0
 
 
-# کدگذاری تمام تنظیمات داخل دکمه‌ها تا به رم سرور وابسته نباشد
+# ذخیره تمام تنظیمات درون دکمه‌ها (Stateless) برای جلوگیری از باگ انقضای جلسه
 def encode_cfg(mode, res, codec, crf, mute, speed):
     m_val = "1" if mute else "0"
     return f"{mode}:{res}:{codec}:{crf}:{m_val}:{speed}"
@@ -96,7 +96,7 @@ def build_config_keyboard(cfg: dict):
     mute = cfg["mute"]
     speed = cfg["speed"]
 
-    # دکمه‌های نوع پردازش
+    # انتخاب نوع عملیات
     b.button(text="🎬 ویدیو" + (" ✅" if mode == "video" else ""), callback_data="cfg:" + encode_cfg("video", res, codec, crf, mute, speed))
     b.button(text="🎵 استخراج MP3" + (" ✅" if mode == "mp3" else ""), callback_data="cfg:" + encode_cfg("mp3", res, codec, crf, mute, speed))
     b.button(text="🎞 گیف GIF" + (" ✅" if mode == "gif" else ""), callback_data="cfg:" + encode_cfg("gif", res, codec, crf, mute, speed))
@@ -213,7 +213,6 @@ async def enqueue_task(callback: types.CallbackQuery):
     cfg_data = callback.data[4:]
     cfg = decode_cfg(cfg_data)
 
-    # دریافت مستقیم فایل از پیامی که این دکمه زیر آن ریپلای شده است
     orig_msg = callback.message.reply_to_message
     if not orig_msg:
         return await callback.message.edit_text("❌ ویدیوی مرجع یافت نشد. لطفاً ویدیو را مجدداً ارسال کنید.")
@@ -275,6 +274,8 @@ async def process_job(job: dict):
     cfg = job["cfg"]
     status_msg = job["status_msg"]
     mode = cfg["mode"]
+    initial_size = job["file_size"]
+    speed_factor = float(cfg.get("speed", "1.0"))
 
     input_path = os.path.join(DOWNLOAD_DIR, f"in_{job_id}.mp4")
     ext = "mp3" if mode == "mp3" else ("gif" if mode == "gif" else "mp4")
@@ -289,7 +290,6 @@ async def process_job(job: dict):
             return
 
         total_duration = await get_video_duration(input_path)
-        speed_factor = float(cfg.get("speed", "1.0"))
         effective_duration = total_duration / speed_factor if speed_factor > 0 else total_duration
 
         await status_msg.edit_text("⚙️ در حال آماده‌سازی و انکود...", reply_markup=get_cancel_keyboard(job_id))
@@ -297,12 +297,13 @@ async def process_job(job: dict):
         cmd = [FFMPEG_BIN, "-y", "-i", input_path]
 
         if mode == "mp3":
-            cmd += ["-vn", "-c:a", "libmp3lame", "-q:a", "2", output_path]
+            cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", "192k", output_path]
+
         elif mode == "gif":
-            fps = "15"
-            speed_filter = f"setpts={1.0 / speed_factor}*PTS," if speed_factor != 1.0 else ""
-            vf = f"{speed_filter}fps={fps},scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-            cmd += ["-vf", vf, output_path]
+            speed_pts = f"setpts={1.0 / speed_factor}*PTS," if speed_factor != 1.0 else ""
+            vf = f"{speed_pts}fps=15,scale=480:-2:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+            cmd += ["-an", "-filter_complex", vf, output_path]
+
         else:
             crf_map = {"light": "23", "medium": "28", "heavy": "34"}
             v_codec = "libx265" if cfg["codec"] == "h265" else "libx264"
@@ -355,7 +356,7 @@ async def process_job(job: dict):
                 if time.time() - last_update > 2.5:
                     try:
                         await status_msg.edit_text(
-                            f"⚙️ در حال تبدیل ({mode}):\n{generate_progress_bar(percent)}",
+                            f"⚙️ در حال پردازش ({mode}):\n{generate_progress_bar(percent)}",
                             reply_markup=get_cancel_keyboard(job_id)
                         )
                         last_update = time.time()
@@ -376,33 +377,66 @@ async def process_job(job: dict):
 
         await status_msg.edit_text("📤 در حال ارسال نتیجه...")
 
+        # ارسال با ساختار مرتب و خوانا
         if mode == "mp3":
+            caption_text = (
+                "✅ **استخراج صدا با موفقیت انجام شد**\n\n"
+                f"📦 حجم اولیه ویدیو: `{initial_size / (1024*1024):.2f} MB`\n"
+                f"📉 حجم فایل صوتی: `{final_size / (1024*1024):.2f} MB`\n"
+                f"⚡ فرمت: `MP3 (192 kbps)`"
+            )
             await bot.send_audio(
                 chat_id=job["chat_id"],
                 audio=FSInputFile(output_path, filename=f"audio_{job_id}.mp3"),
-                caption=f"🎵 استخراج صدا کامل شد | حجم: `{final_size / (1024*1024):.2f} MB`"
+                caption=caption_text
             )
+
         elif mode == "gif":
-            await bot.send_animation(
-                chat_id=job["chat_id"],
-                animation=FSInputFile(output_path, filename=f"anim_{job_id}.gif"),
-                caption=f"🎞 گیف کامل شد | حجم: `{final_size / (1024*1024):.2f} MB`"
+            caption_text = (
+                "✅ **تبدیل به گیف با موفقیت انجام شد**\n\n"
+                f"📦 حجم اولیه ویدیو: `{initial_size / (1024*1024):.2f} MB`\n"
+                f"📉 حجم فایل گیف: `{final_size / (1024*1024):.2f} MB`\n"
+                f"⚡ نرخ فریم: `15 FPS` (سرعت: `{speed_factor}x`)"
             )
+            await bot.send_document(
+                chat_id=job["chat_id"],
+                document=FSInputFile(output_path, filename=f"animation_{job_id}.gif"),
+                caption=caption_text
+            )
+
         else:
-            reduction = max(0, int(((job["file_size"] - final_size) / job["file_size"]) * 100))
+            reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
+            sound_status = "بی‌صدا 🔇" if cfg["mute"] else "همراه با صدا 🔊"
+            caption_text = (
+                "✅ **پردازش با موفقیت انجام شد**\n\n"
+                f"📦 حجم اولیه: `{initial_size / (1024*1024):.2f} MB`\n"
+                f"📉 حجم نهایی: `{final_size / (1024*1024):.2f} MB`\n"
+                f"⚡ میزان فشرده‌سازی: `{reduction}%` کاهش (سرعت: `{speed_factor}x`)\n"
+                f"⚙️ تنظیمات: `{cfg['res']}p | {cfg['codec'].upper()} | {sound_status}`"
+            )
             await bot.send_video(
                 chat_id=job["chat_id"],
                 video=FSInputFile(output_path, filename=f"video_{job_id}.mp4"),
-                caption=(
-                    f"✅ **پردازش به پایان رسید**\n"
-                    f"حجم قبلی: `{job['file_size'] / (1024*1024):.2f} MB`\n"
-                    f"حجم جدید: `{final_size / (1024*1024):.2f} MB`\n"
-                    f"کاهش حجم: `{reduction}%` | سرعت: `{speed_factor}x`"
-                ),
+                caption=caption_text,
                 supports_streaming=True
             )
 
         await status_msg.delete()
+
+        # ثبت گزارش برای ادمین
+        if ADMIN_ID and job["user"].id != ADMIN_ID:
+            u = job["user"]
+            u_name = f"@{u.username}" if u.username else "ندارد"
+            admin_text = (
+                f"🔔 **لاگ پردازش موفق**\n\n"
+                f"👤 **کاربر:** {u.full_name} ({u_name}) | `{u.id}`\n"
+                f"🎯 **عملیات:** `{mode.upper()}`\n"
+                f"⚡ **تغییر حجم:** `{initial_size / (1024*1024):.2f} MB` ← `{final_size / (1024*1024):.2f} MB`"
+            )
+            try:
+                await bot.send_message(ADMIN_ID, admin_text)
+            except Exception:
+                pass
 
     finally:
         for p in (input_path, output_path):
@@ -416,7 +450,7 @@ async def process_job(job: dict):
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(queue_worker())
-    logging.info("ربات بدون وضعیت موقت (Stateless) راه‌اندازی شد.")
+    logging.info("ربات در Railway با معماری Stateless و صف ناهمگام راه‌اندازی شد.")
     await dp.start_polling(bot)
 
 
