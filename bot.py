@@ -2,12 +2,11 @@ import os
 import re
 import sys
 import time
-import uuid
 import asyncio
 import logging
 import subprocess
 
-# نصب خودکار پیش‌نیازها و باینری FFmpeg
+# نصب خودکار پکیج‌ها و باینری FFmpeg
 def setup_dependencies():
     packages = ["aiogram", "imageio-ffmpeg"]
     for pkg in packages:
@@ -41,9 +40,7 @@ dp = Dispatcher()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# صف و دیکشنری‌های مدیریت وضعیت
 JOB_QUEUE = asyncio.Queue()
-TASK_CONFIGS = {}
 ACTIVE_PROCESSES = {}
 
 
@@ -72,41 +69,59 @@ async def get_video_duration(file_path: str) -> float:
         return 0.0
 
 
-def build_config_keyboard(task_id: str, cfg: dict):
-    b = InlineKeyboardBuilder()
-    mode = cfg.get("mode", "video")
+# کدگذاری تمام تنظیمات داخل دکمه‌ها تا به رم سرور وابسته نباشد
+def encode_cfg(mode, res, codec, crf, mute, speed):
+    m_val = "1" if mute else "0"
+    return f"{mode}:{res}:{codec}:{crf}:{m_val}:{speed}"
 
-    # انتخاب حالت کاری اصلی
-    b.button(text="🎬 ویدیو" + (" ✅" if mode == "video" else ""), callback_data=f"set:{task_id}:mode:video")
-    b.button(text="🎵 استخراج MP3" + (" ✅" if mode == "mp3" else ""), callback_data=f"set:{task_id}:mode:mp3")
-    b.button(text="🎞 گیف GIF" + (" ✅" if mode == "gif" else ""), callback_data=f"set:{task_id}:mode:gif")
+
+def decode_cfg(data_str):
+    parts = data_str.split(":")
+    return {
+        "mode": parts[0],
+        "res": parts[1],
+        "codec": parts[2],
+        "crf": parts[3],
+        "mute": parts[4] == "1",
+        "speed": parts[5]
+    }
+
+
+def build_config_keyboard(cfg: dict):
+    b = InlineKeyboardBuilder()
+    mode = cfg["mode"]
+    res = cfg["res"]
+    codec = cfg["codec"]
+    crf = cfg["crf"]
+    mute = cfg["mute"]
+    speed = cfg["speed"]
+
+    # دکمه‌های نوع پردازش
+    b.button(text="🎬 ویدیو" + (" ✅" if mode == "video" else ""), callback_data="cfg:" + encode_cfg("video", res, codec, crf, mute, speed))
+    b.button(text="🎵 استخراج MP3" + (" ✅" if mode == "mp3" else ""), callback_data="cfg:" + encode_cfg("mp3", res, codec, crf, mute, speed))
+    b.button(text="🎞 گیف GIF" + (" ✅" if mode == "gif" else ""), callback_data="cfg:" + encode_cfg("gif", res, codec, crf, mute, speed))
 
     if mode == "video":
-        # رزولوشن
         for r_k, r_t in [("orig", "ابعاد اصلی"), ("1080", "1080p"), ("720", "720p"), ("480", "480p")]:
-            b.button(text=r_t + (" ✅" if cfg["res"] == r_k else ""), callback_data=f"set:{task_id}:res:{r_k}")
+            b.button(text=r_t + (" ✅" if res == r_k else ""), callback_data="cfg:" + encode_cfg(mode, r_k, codec, crf, mute, speed))
 
-        # کدک و شدت فشرده‌سازی
-        b.button(text="H.264" + (" ✅" if cfg["codec"] == "h264" else ""), callback_data=f"set:{task_id}:codec:h264")
-        b.button(text="H.265 (کم‌حجم‌تر)" + (" ✅" if cfg["codec"] == "h265" else ""), callback_data=f"set:{task_id}:codec:h265")
+        b.button(text="H.264" + (" ✅" if codec == "h264" else ""), callback_data="cfg:" + encode_cfg(mode, res, "h264", crf, mute, speed))
+        b.button(text="H.265 (کم‌حجم‌تر)" + (" ✅" if codec == "h265" else ""), callback_data="cfg:" + encode_cfg(mode, res, "h265", crf, mute, speed))
 
-        for c_k, c_t in [("light", "کاهش کم (سریع)"), ("medium", "متعادل"), ("heavy", "کاهش شدید")]:
-            b.button(text=c_t + (" ✅" if cfg["crf"] == c_k else ""), callback_data=f"set:{task_id}:crf:{c_k}")
+        for c_k, c_t in [("light", "کاهش کم"), ("medium", "متعادل"), ("heavy", "کاهش شدید")]:
+            b.button(text=c_t + (" ✅" if crf == c_k else ""), callback_data="cfg:" + encode_cfg(mode, res, codec, c_k, mute, speed))
 
-        # کنترل صدا
-        mute_t = "🔇 صدا: قطع" if cfg["mute"] else "🔊 صدا: وصل"
-        b.button(text=mute_t, callback_data=f"set:{task_id}:mute:{not cfg['mute']}")
+        mute_t = "🔇 صدا: قطع" if mute else "🔊 صدا: وصل"
+        b.button(text=mute_t, callback_data="cfg:" + encode_cfg(mode, res, codec, crf, not mute, speed))
 
     if mode in ["video", "gif"]:
-        # کنترل سرعت پخش
         for s_k, s_t in [("1.0", "1x عادی"), ("1.5", "1.5x"), ("2.0", "2x سریع")]:
-            b.button(text=s_t + (" ✅" if cfg["speed"] == s_k else ""), callback_data=f"set:{task_id}:speed:{s_k}")
+            b.button(text=s_t + (" ✅" if speed == s_k else ""), callback_data="cfg:" + encode_cfg(mode, res, codec, crf, mute, s_k))
 
-    # کلیدهای اقدام
-    b.button(text="🚀 ثبت در صف و شروع", callback_data=f"enqueue:{task_id}")
-    b.button(text="❌ لغو", callback_data=f"cancel:{task_id}")
+    cfg_str = encode_cfg(mode, res, codec, crf, mute, speed)
+    b.button(text="🚀 ثبت در صف و شروع", callback_data=f"run:{cfg_str}")
+    b.button(text="❌ لغو", callback_data="cancel_panel")
 
-    # چینش استاندارد دکمه‌ها
     if mode == "video":
         b.adjust(3, 4, 2, 3, 1, 3, 2)
     elif mode == "gif":
@@ -117,17 +132,15 @@ def build_config_keyboard(task_id: str, cfg: dict):
     return b.as_markup()
 
 
-def get_cancel_keyboard(task_id: str):
+def get_cancel_keyboard(job_id: str):
     b = InlineKeyboardBuilder()
-    b.button(text="❌ انصراف / لغو", callback_data=f"stop:{task_id}")
+    b.button(text="❌ انصراف / لغو", callback_data=f"stop:{job_id}")
     return b.as_markup()
 
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer(
-        "👋 سلام! ویدیوی خود را (حداکثر ۲۰ مگابایت) ارسال کنید تا امکانات پیشرفته فشرده‌سازی، استخراج صدا و تغییر سرعت نمایش داده شود."
-    )
+    await message.answer("🎬 ویدیوی خود را بفرستید تا پنل تنظیمات پیشرفته باز شود.")
 
 
 @dp.message(F.video | F.document)
@@ -139,160 +152,158 @@ async def handle_video(message: types.Message):
     )
 
     if not video:
-        return await message.answer("⚠️ لطفاً فقط فایل ویدیویی بفرستید.")
+        return await message.answer("⚠️ لطفاً فقط فایل ویدیویی ارسال کنید.")
 
     if video.file_size > MAX_DOWNLOAD_SIZE:
-        return await message.answer(
-            f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف مجاز بات (۲۰ مگابایت) بیشتر است."
-        )
+        return await message.answer(f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف مجاز (۲۰ مگابایت) بیشتر است.")
 
-    task_id = uuid.uuid4().hex[:8]
-    TASK_CONFIGS[task_id] = {
-        "file_id": video.file_id,
-        "file_size": video.file_size,
-        "chat_id": message.chat.id,
-        "user": message.from_user,
+    default_cfg = {
         "mode": "video",
         "res": "720",
         "codec": "h264",
         "crf": "medium",
         "mute": False,
-        "speed": "1.0",
-        "msg_id": message.message_id
+        "speed": "1.0"
     }
 
     res_info = f"\n📏 **ابعاد:** `{video.width}x{video.height}`" if hasattr(video, "width") and video.width else ""
 
     await message.reply(
-        f"⚙️ **پنل تنظیمات پردازش ویدیو:**{res_info}\nگزینه‌های مورد نظر را تنظیم و روی «شروع» کلیک کنید:",
-        reply_markup=build_config_keyboard(task_id, TASK_CONFIGS[task_id])
+        f"⚙️ **تنظیمات پردازش ویدیو:**{res_info}\nتنظیمات را مشخص کرده و روی «شروع» بزنید:",
+        reply_markup=build_config_keyboard(default_cfg)
     )
 
 
-@dp.callback_query(F.data.startswith("set:"))
+@dp.callback_query(F.data.startswith("cfg:"))
 async def update_settings(callback: types.CallbackQuery):
     await callback.answer()
-    parts = callback.data.split(":")
-    task_id, key, val = parts[1], parts[2], parts[3]
-
-    if task_id not in TASK_CONFIGS:
-        return await callback.message.edit_text("⚠️ این جلسه منقضی شده است.")
-
-    if key == "mute":
-        TASK_CONFIGS[task_id]["mute"] = (val.lower() == "true")
-    else:
-        TASK_CONFIGS[task_id][key] = val
-
+    cfg_data = callback.data[4:]
+    cfg = decode_cfg(cfg_data)
     try:
-        await callback.message.edit_reply_markup(
-            reply_markup=build_config_keyboard(task_id, TASK_CONFIGS[task_id])
-        )
+        await callback.message.edit_reply_markup(reply_markup=build_config_keyboard(cfg))
     except TelegramBadRequest:
         pass
 
 
-@dp.callback_query(F.data.startswith("cancel:"))
+@dp.callback_query(F.data == "cancel_panel")
 async def cancel_panel(callback: types.CallbackQuery):
-    task_id = callback.data.split(":")[1]
-    TASK_CONFIGS.pop(task_id, None)
     await callback.message.edit_text("❌ عملیات لغو شد.")
 
 
 @dp.callback_query(F.data.startswith("stop:"))
 async def stop_processing(callback: types.CallbackQuery):
-    task_id = callback.data.split(":")[1]
-    if task_id in ACTIVE_PROCESSES:
-        ACTIVE_PROCESSES[task_id]["cancelled"] = True
-        proc = ACTIVE_PROCESSES[task_id].get("proc")
+    job_id = callback.data.split(":")[1]
+    if job_id in ACTIVE_PROCESSES:
+        ACTIVE_PROCESSES[job_id]["cancelled"] = True
+        proc = ACTIVE_PROCESSES[job_id].get("proc")
         if proc and proc.returncode is None:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
         await callback.answer("عملیات متوقف شد.")
-        await callback.message.edit_text("🛑 پردازش توسط شما لغو شد.")
+        await callback.message.edit_text("🛑 پردازش توسط شما متوقف شد.")
     else:
         await callback.answer("پردازش در حال حاضر فعال نیست.", show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("enqueue:"))
+@dp.callback_query(F.data.startswith("run:"))
 async def enqueue_task(callback: types.CallbackQuery):
     await callback.answer()
-    task_id = callback.data.split(":")[1]
+    cfg_data = callback.data[4:]
+    cfg = decode_cfg(cfg_data)
 
-    if task_id not in TASK_CONFIGS:
-        return await callback.message.edit_text("❌ این نشست منقضی شده است.")
+    # دریافت مستقیم فایل از پیامی که این دکمه زیر آن ریپلای شده است
+    orig_msg = callback.message.reply_to_message
+    if not orig_msg:
+        return await callback.message.edit_text("❌ ویدیوی مرجع یافت نشد. لطفاً ویدیو را مجدداً ارسال کنید.")
 
-    cfg = TASK_CONFIGS[task_id]
-    status_msg = await callback.message.edit_text(
-        f"⏳ در صف انتظار سرور قرار گرفتید...\n👥 نوبت شما: **نفر {JOB_QUEUE.qsize() + 1}**",
-        reply_markup=get_cancel_keyboard(task_id)
+    video = orig_msg.video or (
+        orig_msg.document
+        if orig_msg.document and orig_msg.document.mime_type and orig_msg.document.mime_type.startswith("video/")
+        else None
     )
 
-    ACTIVE_PROCESSES[task_id] = {"proc": None, "cancelled": False, "status_msg": status_msg}
-    await JOB_QUEUE.put((task_id, cfg, status_msg))
+    if not video:
+        return await callback.message.edit_text("❌ فایل ویدیویی یافت نشد. لطفاً ویدیو را دوباره بفرستید.")
+
+    job_id = f"{callback.message.chat.id}_{callback.message.message_id}"
+
+    status_msg = await callback.message.edit_text(
+        f"⏳ در صف انتظار سرور قرار گرفتید...\n👥 نوبت شما: **نفر {JOB_QUEUE.qsize() + 1}**",
+        reply_markup=get_cancel_keyboard(job_id)
+    )
+
+    job_payload = {
+        "job_id": job_id,
+        "cfg": cfg,
+        "file_id": video.file_id,
+        "file_size": video.file_size,
+        "chat_id": callback.message.chat.id,
+        "user": callback.from_user,
+        "status_msg": status_msg
+    }
+
+    ACTIVE_PROCESSES[job_id] = {"proc": None, "cancelled": False}
+    await JOB_QUEUE.put(job_payload)
 
 
-# موتور پردازش نوبتی (Worker) جهت جلوگیری از اشباع CPU/RAM
 async def queue_worker():
     while True:
-        task_id, cfg, status_msg = await JOB_QUEUE.get()
+        job = await JOB_QUEUE.get()
+        job_id = job["job_id"]
 
-        if ACTIVE_PROCESSES.get(task_id, {}).get("cancelled"):
+        if ACTIVE_PROCESSES.get(job_id, {}).get("cancelled"):
             JOB_QUEUE.task_done()
             continue
 
         try:
-            await process_job(task_id, cfg, status_msg)
+            await process_job(job)
         except Exception as e:
-            logging.error(f"Worker Error on task {task_id}: {e}", exc_info=True)
+            logging.error(f"Error on job {job_id}: {e}", exc_info=True)
             try:
-                await status_msg.edit_text("⚠️ متأسفانه در اجرای عملیات خطایی رخ داد.")
+                await job["status_msg"].edit_text("⚠️ خطایی در اجرای پردازش پیش آمد.")
             except Exception:
                 pass
         finally:
-            ACTIVE_PROCESSES.pop(task_id, None)
-            TASK_CONFIGS.pop(task_id, None)
+            ACTIVE_PROCESSES.pop(job_id, None)
             JOB_QUEUE.task_done()
 
 
-async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
+async def process_job(job: dict):
+    job_id = job["job_id"]
+    cfg = job["cfg"]
+    status_msg = job["status_msg"]
     mode = cfg["mode"]
-    file_id = cfg["file_id"]
-    initial_size = cfg["file_size"]
-    user = cfg["user"]
 
-    input_path = os.path.join(DOWNLOAD_DIR, f"in_{task_id}.mp4")
+    input_path = os.path.join(DOWNLOAD_DIR, f"in_{job_id}.mp4")
     ext = "mp3" if mode == "mp3" else ("gif" if mode == "gif" else "mp4")
-    output_path = os.path.join(DOWNLOAD_DIR, f"out_{task_id}.{ext}")
+    output_path = os.path.join(DOWNLOAD_DIR, f"out_{job_id}.{ext}")
 
     try:
-        await status_msg.edit_text("📥 در حال دریافت فایل...", reply_markup=get_cancel_keyboard(task_id))
-        file_info = await bot.get_file(file_id)
+        await status_msg.edit_text("📥 در حال دریافت فایل از تلگرام...", reply_markup=get_cancel_keyboard(job_id))
+        file_info = await bot.get_file(job["file_id"])
         await bot.download_file(file_info.file_path, destination=input_path)
 
-        if ACTIVE_PROCESSES[task_id]["cancelled"]:
+        if ACTIVE_PROCESSES[job_id]["cancelled"]:
             return
 
         total_duration = await get_video_duration(input_path)
         speed_factor = float(cfg.get("speed", "1.0"))
         effective_duration = total_duration / speed_factor if speed_factor > 0 else total_duration
 
-        await status_msg.edit_text("⚙️ در حال آماده‌سازی پردازش...", reply_markup=get_cancel_keyboard(task_id))
+        await status_msg.edit_text("⚙️ در حال آماده‌سازی و انکود...", reply_markup=get_cancel_keyboard(job_id))
 
-        # ساخت خط فرمان FFmpeg بر اساس تنظیمات
         cmd = [FFMPEG_BIN, "-y", "-i", input_path]
 
         if mode == "mp3":
             cmd += ["-vn", "-c:a", "libmp3lame", "-q:a", "2", output_path]
-
         elif mode == "gif":
             fps = "15"
             speed_filter = f"setpts={1.0 / speed_factor}*PTS," if speed_factor != 1.0 else ""
             vf = f"{speed_filter}fps={fps},scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
             cmd += ["-vf", vf, output_path]
-
-        else:  # mode == video
+        else:
             crf_map = {"light": "23", "medium": "28", "heavy": "34"}
             v_codec = "libx265" if cfg["codec"] == "h265" else "libx264"
             scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2" if cfg["res"] == "orig" else f"scale=-2:{cfg['res']}"
@@ -322,11 +333,10 @@ async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
 
             cmd += ["-progress", "pipe:2", output_path]
 
-        # اجرای پردازش
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
-        ACTIVE_PROCESSES[task_id]["proc"] = process
+        ACTIVE_PROCESSES[job_id]["proc"] = process
 
         last_update = 0.0
         time_pattern = re.compile(r"out_time_us=(\d+)")
@@ -338,7 +348,7 @@ async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
             line_str = line.decode(errors="ignore").strip()
 
             match = time_pattern.search(line_str)
-            if match and effective_duration > 0 and not ACTIVE_PROCESSES[task_id]["cancelled"]:
+            if match and effective_duration > 0 and not ACTIVE_PROCESSES[job_id]["cancelled"]:
                 current_secs = float(match.group(1)) / 1_000_000.0
                 percent = min(100.0, (current_secs / effective_duration) * 100.0)
 
@@ -346,7 +356,7 @@ async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
                     try:
                         await status_msg.edit_text(
                             f"⚙️ در حال تبدیل ({mode}):\n{generate_progress_bar(percent)}",
-                            reply_markup=get_cancel_keyboard(task_id)
+                            reply_markup=get_cancel_keyboard(job_id)
                         )
                         last_update = time.time()
                     except (TelegramBadRequest, TelegramRetryAfter):
@@ -354,7 +364,7 @@ async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
 
         await process.wait()
 
-        if ACTIVE_PROCESSES[task_id]["cancelled"]:
+        if ACTIVE_PROCESSES[job_id]["cancelled"]:
             return
 
         if process.returncode != 0 or not os.path.exists(output_path):
@@ -362,32 +372,31 @@ async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
 
         final_size = os.path.getsize(output_path)
         if final_size > MAX_UPLOAD_SIZE:
-            return await status_msg.edit_text("❌ حجم خروجی از حد مجاز آپلود تلگرام بیشتر شد.")
+            return await status_msg.edit_text("❌ حجم فایل خروجی بیشتر از سقف مجاز آپلود تلگرام شد.")
 
-        await status_msg.edit_text("📤 در حال آپلود خروجی...")
+        await status_msg.edit_text("📤 در حال ارسال نتیجه...")
 
-        # ارسال فایل متناسب با فرمت انتخابی
         if mode == "mp3":
             await bot.send_audio(
-                chat_id=cfg["chat_id"],
-                audio=FSInputFile(output_path, filename=f"audio_{task_id}.mp3"),
-                caption=f"🎵 **استخراج صدا کامل شد**\nحجم: `{final_size / (1024*1024):.2f} MB`"
+                chat_id=job["chat_id"],
+                audio=FSInputFile(output_path, filename=f"audio_{job_id}.mp3"),
+                caption=f"🎵 استخراج صدا کامل شد | حجم: `{final_size / (1024*1024):.2f} MB`"
             )
         elif mode == "gif":
             await bot.send_animation(
-                chat_id=cfg["chat_id"],
-                animation=FSInputFile(output_path, filename=f"anim_{task_id}.gif"),
-                caption=f"🎞 **گیف با موفقیت ساخته شد**\nحجم: `{final_size / (1024*1024):.2f} MB`"
+                chat_id=job["chat_id"],
+                animation=FSInputFile(output_path, filename=f"anim_{job_id}.gif"),
+                caption=f"🎞 گیف کامل شد | حجم: `{final_size / (1024*1024):.2f} MB`"
             )
         else:
-            reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
+            reduction = max(0, int(((job["file_size"] - final_size) / job["file_size"]) * 100))
             await bot.send_video(
-                chat_id=cfg["chat_id"],
-                video=FSInputFile(output_path, filename=f"video_{task_id}.mp4"),
+                chat_id=job["chat_id"],
+                video=FSInputFile(output_path, filename=f"video_{job_id}.mp4"),
                 caption=(
-                    f"✅ **پردازش ویدیو کامل شد**\n"
-                    f"حجم اولیه: `{initial_size / (1024*1024):.2f} MB`\n"
-                    f"حجم نهایی: `{final_size / (1024*1024):.2f} MB`\n"
+                    f"✅ **پردازش به پایان رسید**\n"
+                    f"حجم قبلی: `{job['file_size'] / (1024*1024):.2f} MB`\n"
+                    f"حجم جدید: `{final_size / (1024*1024):.2f} MB`\n"
                     f"کاهش حجم: `{reduction}%` | سرعت: `{speed_factor}x`"
                 ),
                 supports_streaming=True
@@ -406,9 +415,8 @@ async def process_job(task_id: str, cfg: dict, status_msg: types.Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # اجرای Worker صف به شکل پس‌زمینه
     asyncio.create_task(queue_worker())
-    logging.info("ربات و Worker صف در Railway آماده به کار هستند.")
+    logging.info("ربات بدون وضعیت موقت (Stateless) راه‌اندازی شد.")
     await dp.start_polling(bot)
 
 
