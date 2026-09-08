@@ -327,6 +327,7 @@ async def process_job(job: dict):
     ui_task = asyncio.create_task(ui_updater_task(ui_state))
 
     try:
+        # مدیریت دانلود یکپارچه بین فایل های کوچک و بزرگ
         if initial_size < 19.5 * 1024 * 1024:
             ui_state["percent"] = 50.0
             file_info = await bot.get_file(job["file_id"])
@@ -349,6 +350,7 @@ async def process_job(job: dict):
         ui_state["action"] = "encode"
         ui_state["percent"] = 0.0
 
+        # بهینه سازی محدودیت منابع برای جلوگیری از Exit Code 137 در Railway
         cmd = [
             FFMPEG_BIN, "-y", "-i", input_path,
             "-threads", "2", 
@@ -413,6 +415,7 @@ async def process_job(job: dict):
         else:
             caption_text = f"✅ پردازش انجام شد\n\n📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
 
+        # تفکیک آپلود براساس حجم برای افزایش پایداری شبکه
         if final_size < 49.5 * 1024 * 1024:
             ui_state["action"] = "upload_http"
             ui_state["percent"] = 75.0
@@ -463,36 +466,38 @@ async def process_job(job: dict):
                     pass
 
 
-async def main():
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except TelegramRetryAfter as e:
-        logging.warning(f"محدودیت DeleteWebhook: {e.retry_after} ثانیه وقفه.")
-        pass # نادیده گرفتن خطا جهت جلوگیری از توقف برنامه
-    except Exception as e:
-        logging.error(f"خطا در حذف وب‌هوک: {e}")
-
-    # مدیریت استارت Pyrogram با کنترل FloodWait
+async def start_pyrogram_safely():
     while True:
         try:
             await pyro.start()
+            logging.info("✅ موتور قدرتمند Pyrogram متصل شد.")
             break
         except Exception as e:
             if "FLOOD_WAIT" in str(e).upper():
                 match = re.search(r'\d+', str(e))
                 wait_time = int(match.group()) if match else 60
-                logging.warning(f"محدودیت ورود Pyrogram: {wait_time} ثانیه توقف...")
+                logging.warning(f"⚠️ محدودیت ورود Pyrogram. ربات اصلی کار میکند اما دانلود فایل حجیم {wait_time} ثانیه دیگر فعال میشود...")
                 await asyncio.sleep(wait_time + 1)
             else:
-                raise e
+                logging.error(f"خطا در اتصال Pyrogram: {e}")
+                await asyncio.sleep(5)
 
+
+async def main():
+    # استارت کردن Pyrogram در بک‌گراند 
+    asyncio.create_task(start_pyrogram_safely())
     asyncio.create_task(queue_worker())
-    logging.info("ربات دو موتوره بدون مشکل محدودیت فعال شد.")
+    
+    logging.info("✅ موتور اصلی ربات (Aiogram) فعال شد. ربات هم‌اکنون در تلگرام پاسخگو است.")
+    
     try:
-        await dp.start_polling(bot)
+        # حذف کردن متد قبلی delete_webhook و استفاده از پارامتر در زمان استارت برای جلوگیری از بن شدن سرور
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
-        await pyro.stop()
-
+        try:
+            await pyro.stop()
+        except:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
