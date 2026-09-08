@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.types import FSInputFile
 from pyrogram import Client as PyroClient
 
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
@@ -232,6 +233,7 @@ async def enqueue_task(callback: types.CallbackQuery):
         "cfg": cfg,
         "msg_id": orig_msg.message_id,
         "file_size": video.file_size,
+        "file_id": video.file_id,
         "chat_id": callback.message.chat.id,
         "user": callback.from_user,
         "status_msg": status_msg
@@ -263,7 +265,7 @@ async def queue_worker():
             JOB_QUEUE.task_done()
 
 
-# --- سیستم آپدیت مستقل گرافیکی با مدیریت دقیق FloodWait ---
+# رابط کاربری ضد بلاک و مستقل
 async def ui_updater_task(state: dict):
     last_text = ""
     while not state.get("done", False):
@@ -276,8 +278,10 @@ async def ui_updater_task(state: dict):
                 text = f"📥 در حال دریافت فایل:\n{bar}"
             elif action == "encode":
                 text = f"⚙️ در حال پردازش:\n{bar}"
-            elif action == "upload":
-                text = f"📤 در حال ارسال به تلگرام:\n{bar}"
+            elif action == "upload_pyro":
+                text = f"📤 در حال ارسال به تلگرام (موتور MTProto):\n{bar}"
+            elif action == "upload_http":
+                text = f"📤 در حال ارسال فایل (موتور سریع HTTP)...\n{bar}"
             else:
                 text = "⏳ لطفا صبر کنید..."
 
@@ -286,27 +290,18 @@ async def ui_updater_task(state: dict):
                 last_text = text
                 
         except TelegramRetryAfter as e:
-            # مهم‌ترین بخش: اگر تلگرام لیمیت کرد، دقیقاً به همون اندازه منتظر می‌مانیم
-            logging.warning(f"FloodWait hit! Sleeping for {e.retry_after} seconds...")
             await asyncio.sleep(e.retry_after)
             continue
-        except TelegramBadRequest as e:
+        except (TelegramBadRequest, asyncio.CancelledError):
             pass
-        except asyncio.CancelledError:
-            break
         except Exception:
             pass
         
-        # استراحت ۴ ثانیه‌ای بین آپدیت‌ها برای حفظ ارتباط پایدار
-        await asyncio.sleep(4.0)
+        await asyncio.sleep(3.5)
 
 
-# کالبک کاملاً Async و پشتیبانی از قطع شدن توسط کاربر
-async def py_progress_callback(current, total, state):
-    job_id = state.get("job_id")
-    if ACTIVE_PROCESSES.get(job_id, {}).get("cancelled"):
-        raise asyncio.CancelledError("User cancelled operation")
-        
+# تبدیل شدن کالبک به حالت Sync تا جلوی استریم فایل در Pyrogram را نگیرد
+def py_progress_callback(current, total, state):
     if total > 0:
         state["percent"] = (current / total) * 100.0
 
@@ -334,17 +329,21 @@ async def process_job(job: dict):
     ui_task = asyncio.create_task(ui_updater_task(ui_state))
 
     try:
-        target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
-        
-        # مرحله ۱: دانلود
-        try:
+        # مرحله ۱: دانلود هوشمند (ترافیک کم با Aiogram، ترافیک بالا با Pyrogram)
+        if initial_size < 19.5 * 1024 * 1024:
+            # دانلود سریع فایل‌های زیر ۲۰ مگابایت با HTTP پایدار
+            ui_state["percent"] = 50.0 # نمایش حدودی پیشرفت
+            file_info = await bot.get_file(job["file_id"])
+            await bot.download_file(file_info.file_path, destination=input_path)
+            ui_state["percent"] = 100.0
+        else:
+            # دانلود فایل‌های سنگین با MTProto
+            target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
             await target_pyro_msg.download(
                 file_name=input_path,
                 progress=py_progress_callback,
                 progress_args=(ui_state,)
             )
-        except asyncio.CancelledError:
-            return
 
         if ACTIVE_PROCESSES[job_id]["cancelled"]:
             return
@@ -366,27 +365,16 @@ async def process_job(job: dict):
                 vf_chains.append(f"setpts={1.0 / speed_factor}*PTS")
             vf_chains.append("fps=15")
             vf_chains.append("scale=480:-2")
-
-            cmd += [
-                "-an", "-c:v", "libx264", "-vf", ",".join(vf_chains),
-                "-crf", "26", "-preset", "faster", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", "-progress", "pipe:2", output_path
-            ]
+            cmd += ["-an", "-c:v", "libx264", "-vf", ",".join(vf_chains), "-crf", "26", "-preset", "faster", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-progress", "pipe:2", output_path]
         else:
             crf_map = {"light": "23", "medium": "28", "heavy": "34"}
             v_codec = "libx265" if cfg["codec"] == "h265" else "libx264"
             scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2" if cfg["res"] == "orig" else f"scale=-2:{cfg['res']}"
-
             vf_chains = []
             if speed_factor != 1.0:
                 vf_chains.append(f"setpts={1.0 / speed_factor}*PTS")
             vf_chains.append(scale_filter)
-
-            cmd += [
-                "-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains),
-                "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "faster",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart"
-            ]
+            cmd += ["-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains), "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "faster", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
             if cfg["mute"]:
                 cmd += ["-an"]
             else:
@@ -396,9 +384,7 @@ async def process_job(job: dict):
                 cmd += ["-c:a", "aac", "-b:a", "128k"]
             cmd += ["-progress", "pipe:2", output_path]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         ACTIVE_PROCESSES[job_id]["proc"] = process
         time_pattern = re.compile(r"out_time_us=(\d+)")
 
@@ -408,7 +394,6 @@ async def process_job(job: dict):
                 break
             line_str = line.decode(errors="ignore").strip()
             match = time_pattern.search(line_str)
-            
             if match and effective_duration > 0 and not ACTIVE_PROCESSES[job_id]["cancelled"]:
                 current_secs = float(match.group(1)) / 1_000_000.0
                 ui_state["percent"] = (current_secs / effective_duration) * 100.0
@@ -424,61 +409,38 @@ async def process_job(job: dict):
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        # مرحله ۳: آپلود
-        ui_state["action"] = "upload"
-        ui_state["percent"] = 0.0
+        # مرحله ۳: آپلود هوشمند (جلوگیری قطعی از فریز شدن فایل‌های کوچک)
+        if mode == "mp3":
+            caption_text = f"✅ پردازش انجام شد\n\n📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n⚡ فشرده‌سازی: {reduction}% کاهش (فرمت MP3)"
+        else:
+            caption_text = f"✅ پردازش انجام شد\n\n📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
 
-        try:
+        # اگر فایل خروجی کمتر از 49.5 مگابایت باشد، برای سرعت و ثبات ۱۰۰٪ با موتور Aiogram HTTP ارسال می‌شود
+        if final_size < 49.5 * 1024 * 1024:
+            ui_state["action"] = "upload_http"
+            ui_state["percent"] = 75.0
+            
             if mode == "mp3":
-                caption_text = (
-                    "✅ پردازش انجام شد\n\n"
-                    f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
-                    f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                    f"⚡ فشرده‌سازی: {reduction}% کاهش (فرمت MP3)"
-                )
-                await pyro.send_audio(
-                    chat_id=job["chat_id"],
-                    audio=output_path,
-                    caption=caption_text,
-                    progress=py_progress_callback,
-                    progress_args=(ui_state,)
-                )
-
+                await bot.send_audio(chat_id=job["chat_id"], audio=FSInputFile(output_path), caption=caption_text)
             elif mode == "gif":
-                caption_text = (
-                    "✅ پردازش انجام شد\n\n"
-                    f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
-                    f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                    f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
-                )
-                await pyro.send_animation(
-                    chat_id=job["chat_id"],
-                    animation=output_path,
-                    caption=caption_text,
-                    unsave=True,
-                    progress=py_progress_callback,
-                    progress_args=(ui_state,)
-                )
-
+                await bot.send_animation(chat_id=job["chat_id"], animation=FSInputFile(output_path), caption=caption_text)
             else:
-                caption_text = (
-                    "✅ پردازش انجام شد\n\n"
-                    f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
-                    f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                    f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
-                )
-                await pyro.send_video(
-                    chat_id=job["chat_id"],
-                    video=output_path,
-                    caption=caption_text,
-                    supports_streaming=True,
-                    progress=py_progress_callback,
-                    progress_args=(ui_state,)
-                )
-        except asyncio.CancelledError:
-            return
+                await bot.send_video(chat_id=job["chat_id"], video=FSInputFile(output_path), caption=caption_text, supports_streaming=True)
+                
+            ui_state["percent"] = 100.0
+            
+        else:
+            # فقط فایل‌های حجیم که Aiogram نمی‌تواند آپلود کند به موتور Pyrogram سپرده می‌شوند
+            ui_state["action"] = "upload_pyro"
+            ui_state["percent"] = 0.0
+            
+            if mode == "mp3":
+                await pyro.send_audio(chat_id=job["chat_id"], audio=output_path, caption=caption_text, progress=py_progress_callback, progress_args=(ui_state,))
+            elif mode == "gif":
+                await pyro.send_animation(chat_id=job["chat_id"], animation=output_path, caption=caption_text, unsave=True, progress=py_progress_callback, progress_args=(ui_state,))
+            else:
+                await pyro.send_video(chat_id=job["chat_id"], video=output_path, caption=caption_text, supports_streaming=True, progress=py_progress_callback, progress_args=(ui_state,))
 
-        # پایان پردازش
         ui_state["done"] = True
         ui_task.cancel()
         await status_msg.delete()
@@ -486,12 +448,7 @@ async def process_job(job: dict):
         if ADMIN_ID and job["user"].id != ADMIN_ID:
             u = job["user"]
             u_name = f"@{u.username}" if u.username else "ندارد"
-            admin_text = (
-                f"🔔 لاگ موفق\n\n"
-                f"👤 کاربر: {u.full_name} ({u_name}) | {u.id}\n"
-                f"🎯 نوع: {mode.upper()}\n"
-                f"⚡ تغییر: {initial_size / (1024*1024):.2f} MB ← {final_size / (1024*1024):.2f} MB"
-            )
+            admin_text = f"🔔 لاگ موفق\n\n👤 کاربر: {u.full_name} ({u_name}) | {u.id}\n🎯 نوع: {mode.upper()}\n⚡ تغییر: {initial_size / (1024*1024):.2f} MB ← {final_size / (1024*1024):.2f} MB"
             try:
                 await bot.send_message(ADMIN_ID, admin_text)
             except Exception:
@@ -514,7 +471,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await pyro.start()
     asyncio.create_task(queue_worker())
-    logging.info("ربات بدون مشکل FloodWait فعال شد.")
+    logging.info("ربات دو موتوره (Aiogram برای سرعت + Pyrogram برای فایل‌های غول‌پیکر) فعال شد.")
     try:
         await dp.start_polling(bot)
     finally:
