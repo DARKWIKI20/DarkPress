@@ -135,7 +135,7 @@ def get_cancel_keyboard(job_id: str):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("🎬 ویدیوی خود را بفرستید تا پنل تنظیمات باز شود.")
+    await message.answer("🎬 ویدیوی خود را ارسال کنید (حداکثر ۲ گیگابایت).")
 
 
 @dp.message(F.video | F.document)
@@ -150,7 +150,7 @@ async def handle_video(message: types.Message):
         return await message.answer("⚠️ لطفاً فقط فایل ویدیویی ارسال کنید.")
 
     if video.file_size > MAX_FILE_SIZE:
-        return await message.answer(f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف ۲ گیگابایت بیشتر است.")
+        return await message.answer(f"❌ حجم فایل از سقف ۲ گیگابایت بیشتر است.")
 
     default_cfg = {
         "mode": "video",
@@ -164,7 +164,7 @@ async def handle_video(message: types.Message):
     res_info = f"\n📏 **ابعاد:** `{video.width}x{video.height}`" if hasattr(video, "width") and video.width else ""
 
     await message.reply(
-        f"⚙️ **تنظیمات پردازش ویدیو:**{res_info}\nتنظیمات را مشخص کرده و روی «شروع» بزنید:",
+        f"⚙️ **تنظیمات پردازش:**{res_info}\nتنظیمات را مشخص کرده و روی «شروع» بزنید:",
         reply_markup=build_config_keyboard(default_cfg)
     )
 
@@ -264,40 +264,37 @@ async def queue_worker():
             JOB_QUEUE.task_done()
 
 
-# --- Worker ایزوله برای آپدیت گرافیکی (جلوگیری از مسدود شدن آپلود) ---
-async def ui_updater_task(status_msg, state, job_id):
-    last_text = ""
-    while not state.get("done"):
-        try:
-            action = state.get("action")
-            current = state.get("current", 0)
-            total = state.get("total", 1)
-            
-            percent = (current / total) * 100.0 if total > 0 else 0.0
-            percent = min(100.0, max(0.0, percent))
-            
-            if action == "download":
-                text = f"📥 در حال دریافت فایل:\n{generate_progress_bar(percent)}"
-            elif action == "encode":
-                text = f"⚙️ در حال پردازش:\n{generate_progress_bar(percent)}"
-            elif action == "upload":
-                text = f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(percent)}"
-            else:
-                text = "⏳ در حال آماده‌سازی..."
-                
-            if text != last_text:
-                await status_msg.edit_text(text, reply_markup=get_cancel_keyboard(job_id))
-                last_text = text
-                
-        except asyncio.CancelledError:
-            break
-        except (TelegramBadRequest, TelegramRetryAfter):
-            pass
-        except Exception:
-            pass
-        
-        # استراحت ۳.۵ ثانیه‌ای مطلق برای جلوگیری از FloodWait
-        await asyncio.sleep(3.5)
+# سیستم یکپارچه گرافیکی و ضد-بلاک
+async def update_ui(state: dict):
+    now = time.time()
+    if now - state["last_update"] < 3.0:
+        return
+    
+    state["last_update"] = now
+    percent = min(100.0, max(0.0, state["percent"]))
+    bar = generate_progress_bar(percent)
+    
+    if state["action"] == "download":
+        text = f"📥 در حال دریافت فایل:\n{bar}"
+    elif state["action"] == "encode":
+        text = f"⚙️ در حال پردازش:\n{bar}"
+    elif state["action"] == "upload":
+        text = f"📤 در حال ارسال به تلگرام:\n{bar}"
+    else:
+        text = "⏳ لطفا صبر کنید..."
+
+    try:
+        await state["status_msg"].edit_text(text, reply_markup=get_cancel_keyboard(state["job_id"]))
+    except (TelegramBadRequest, TelegramRetryAfter):
+        pass
+    except Exception:
+        pass
+
+
+async def py_progress_callback(current, total, state):
+    if total > 0:
+        state["percent"] = (current / total) * 100.0
+        await update_ui(state)
 
 
 async def process_job(job: dict):
@@ -312,21 +309,24 @@ async def process_job(job: dict):
     ext = "mp3" if mode == "mp3" else "mp4"
     output_path = os.path.join(DOWNLOAD_DIR, f"out_{job_id}.{ext}")
 
-    # استیت ماشین پیشرفت کار
-    ui_state = {"action": "init", "current": 0, "total": 1, "done": False}
-    ui_task = asyncio.create_task(ui_updater_task(status_msg, ui_state, job_id))
+    ui_state = {
+        "status_msg": status_msg,
+        "job_id": job_id,
+        "action": "download",
+        "percent": 0.0,
+        "last_update": 0.0
+    }
 
     try:
-        ui_state["action"] = "download"
+        await update_ui(ui_state)
         
-        async def download_progress(current, total):
-            ui_state["current"] = current
-            ui_state["total"] = total
-
         target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
+        
+        # مرحله دانلود
         await target_pyro_msg.download(
             file_name=input_path,
-            progress=download_progress
+            progress=py_progress_callback,
+            progress_args=(ui_state,)
         )
 
         if ACTIVE_PROCESSES[job_id]["cancelled"]:
@@ -336,14 +336,14 @@ async def process_job(job: dict):
         effective_duration = total_duration / speed_factor if speed_factor > 0 else total_duration
 
         ui_state["action"] = "encode"
-        ui_state["current"] = 0
-        ui_state["total"] = effective_duration
+        ui_state["percent"] = 0.0
+        ui_state["last_update"] = 0.0
+        await update_ui(ui_state)
 
         cmd = [FFMPEG_BIN, "-y", "-i", input_path]
 
         if mode == "mp3":
             cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", "192k", output_path]
-
         elif mode == "gif":
             vf_chains = []
             if speed_factor != 1.0:
@@ -352,17 +352,10 @@ async def process_job(job: dict):
             vf_chains.append("scale=480:-2")
 
             cmd += [
-                "-an",
-                "-c:v", "libx264",
-                "-vf", ",".join(vf_chains),
-                "-crf", "26",
-                "-preset", "faster",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-progress", "pipe:2",
-                output_path
+                "-an", "-c:v", "libx264", "-vf", ",".join(vf_chains),
+                "-crf", "26", "-preset", "faster", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", "-progress", "pipe:2", output_path
             ]
-
         else:
             crf_map = {"light": "23", "medium": "28", "heavy": "34"}
             v_codec = "libx265" if cfg["codec"] == "h265" else "libx264"
@@ -374,15 +367,10 @@ async def process_job(job: dict):
             vf_chains.append(scale_filter)
 
             cmd += [
-                "-map", "0:v:0",
-                "-c:v", v_codec,
-                "-vf", ",".join(vf_chains),
-                "-crf", crf_map.get(cfg["crf"], "28"),
-                "-preset", "faster",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart"
+                "-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains),
+                "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "faster",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart"
             ]
-
             if cfg["mute"]:
                 cmd += ["-an"]
             else:
@@ -390,7 +378,6 @@ async def process_job(job: dict):
                 if speed_factor != 1.0:
                     cmd += ["-filter:a", f"atempo={speed_factor}"]
                 cmd += ["-c:a", "aac", "-b:a", "128k"]
-
             cmd += ["-progress", "pipe:2", output_path]
 
         process = await asyncio.create_subprocess_exec(
@@ -405,9 +392,11 @@ async def process_job(job: dict):
                 break
             line_str = line.decode(errors="ignore").strip()
             match = time_pattern.search(line_str)
+            
             if match and effective_duration > 0 and not ACTIVE_PROCESSES[job_id]["cancelled"]:
                 current_secs = float(match.group(1)) / 1_000_000.0
-                ui_state["current"] = current_secs
+                ui_state["percent"] = (current_secs / effective_duration) * 100.0
+                await update_ui(ui_state)
 
         await process.wait()
 
@@ -415,78 +404,77 @@ async def process_job(job: dict):
             return
 
         if process.returncode != 0 or not os.path.exists(output_path):
-            ui_state["done"] = True
-            ui_task.cancel()
             return await status_msg.edit_text("❌ پردازش فایل با خطا مواجه شد.")
 
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
+        # مرحله آپلود
         ui_state["action"] = "upload"
-        ui_state["current"] = 0
-        ui_state["total"] = final_size
-
-        async def upload_progress(current, total):
-            # این تابع حالا کاملا سبک است و جلوی آپلود را نمی‌گیرد
-            ui_state["current"] = current
-            ui_state["total"] = total
+        ui_state["percent"] = 0.0
+        ui_state["last_update"] = 0.0
+        await update_ui(ui_state)
+        
+        # استراحت کوتاه برای اطمینان از بسته شدن هندلرهای فایل قبل از آپلود
+        await asyncio.sleep(1)
 
         if mode == "mp3":
             caption_text = (
-                "✅ پردازش با موفقیت انجام شد\n\n"
+                "✅ پردازش انجام شد\n\n"
                 f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
                 f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                f"⚡ میزان فشرده‌سازی: {reduction}% کاهش (فرمت: MP3)"
+                f"⚡ فشرده‌سازی: {reduction}% کاهش (فرمت MP3)"
             )
             await pyro.send_audio(
                 chat_id=job["chat_id"],
                 audio=output_path,
                 caption=caption_text,
-                progress=upload_progress
+                progress=py_progress_callback,
+                progress_args=(ui_state,)
             )
 
         elif mode == "gif":
             caption_text = (
-                "✅ پردازش با موفقیت انجام شد\n\n"
+                "✅ پردازش انجام شد\n\n"
                 f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
                 f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                f"⚡ میزان فشرده‌سازی: {reduction}% کاهش (سرعت: {speed_factor}x)"
+                f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
             )
             await pyro.send_animation(
                 chat_id=job["chat_id"],
                 animation=output_path,
                 caption=caption_text,
                 unsave=True,
-                progress=upload_progress
+                progress=py_progress_callback,
+                progress_args=(ui_state,)
             )
 
         else:
             caption_text = (
-                "✅ پردازش با موفقیت انجام شد\n\n"
+                "✅ پردازش انجام شد\n\n"
                 f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
                 f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                f"⚡ میزان فشرده‌سازی: {reduction}% کاهش (سرعت: {speed_factor}x)"
+                f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
             )
             await pyro.send_video(
                 chat_id=job["chat_id"],
                 video=output_path,
                 caption=caption_text,
                 supports_streaming=True,
-                progress=upload_progress
+                progress=py_progress_callback,
+                progress_args=(ui_state,)
             )
 
-        ui_state["done"] = True
-        ui_task.cancel()
         await status_msg.delete()
 
         if ADMIN_ID and job["user"].id != ADMIN_ID:
             u = job["user"]
             u_name = f"@{u.username}" if u.username else "ندارد"
             admin_text = (
-                f"🔔 لاگ پردازش موفق\n\n"
+                f"🔔 لاگ موفق\n\n"
                 f"👤 کاربر: {u.full_name} ({u_name}) | {u.id}\n"
                 f"🎯 نوع: {mode.upper()}\n"
-                f"⚡ تغییر حجم: {initial_size / (1024*1024):.2f} MB ← {final_size / (1024*1024):.2f} MB"
+                f"⚡ تغییر: {initial_size / (1024*1024):.2f} MB ← {final_size / (1024*1024):.2f} MB"
             )
             try:
                 await bot.send_message(ADMIN_ID, admin_text)
@@ -494,10 +482,6 @@ async def process_job(job: dict):
                 pass
 
     finally:
-        ui_state["done"] = True
-        if not ui_task.done():
-            ui_task.cancel()
-            
         for p in (input_path, output_path):
             if os.path.exists(p):
                 try:
