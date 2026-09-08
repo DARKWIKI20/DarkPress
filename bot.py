@@ -349,7 +349,6 @@ async def process_job(job: dict):
         ui_state["action"] = "encode"
         ui_state["percent"] = 0.0
 
-        # بهینه سازی FFmpeg جهت جلوگیری از کرش رم (OOM)
         cmd = [
             FFMPEG_BIN, "-y", "-i", input_path,
             "-threads", "2", 
@@ -465,10 +464,30 @@ async def process_job(job: dict):
 
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await pyro.start()
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except TelegramRetryAfter as e:
+        logging.warning(f"محدودیت DeleteWebhook: {e.retry_after} ثانیه وقفه.")
+        pass # نادیده گرفتن خطا جهت جلوگیری از توقف برنامه
+    except Exception as e:
+        logging.error(f"خطا در حذف وب‌هوک: {e}")
+
+    # مدیریت استارت Pyrogram با کنترل FloodWait
+    while True:
+        try:
+            await pyro.start()
+            break
+        except Exception as e:
+            if "FLOOD_WAIT" in str(e).upper():
+                match = re.search(r'\d+', str(e))
+                wait_time = int(match.group()) if match else 60
+                logging.warning(f"محدودیت ورود Pyrogram: {wait_time} ثانیه توقف...")
+                await asyncio.sleep(wait_time + 1)
+            else:
+                raise e
+
     asyncio.create_task(queue_worker())
-    logging.info("ربات دو موتوره (Aiogram برای سرعت + Pyrogram برای فایل‌های غول‌پیکر) فعال شد.")
+    logging.info("ربات دو موتوره بدون مشکل محدودیت فعال شد.")
     try:
         await dp.start_polling(bot)
     finally:
