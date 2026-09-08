@@ -16,20 +16,17 @@ FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# مقادیر کلیدی
+# مقادیر احراز هویت
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8812733722:AAEFW8oxPPQYyqrqHGtnvS8fTpu3ATxcDbo")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6616272875"))
-API_ID = int(os.getenv("API_ID", "12345678"))          # شناسه عددی my.telegram.org را بگذارید
-API_HASH = os.getenv("API_HASH", "YOUR_API_HASH_HERE") # هش ۳۲ کاراکتری خود را بگذارید
+API_ID = int(os.getenv("API_ID", "26202905"))
+API_HASH = os.getenv("API_HASH", "ec9fd909b90288d01befa4f87c8d71c1")
 
-# افزایش سقف‌ها به ۲ گیگابایت به لطف MTProto
-MAX_FILE_SIZE = 2000 * 1024 * 1024 
+MAX_FILE_SIZE = 2000 * 1024 * 1024
 
-# کلاینت Aiogram برای پیام‌ها
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# کلاینت Pyrogram برای دور زدن محدودیت‌های دانلود و آپلود
 pyro = PyroClient(
     name="bot_engine",
     api_id=API_ID,
@@ -139,7 +136,7 @@ def get_cancel_keyboard(job_id: str):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("🎬 ویدیوی خود را (حداکثر ۲ گیگابایت) ارسال کنید.")
+    await message.answer("🎬 ویدیوی خود را ارسال کنید تا پنل تنظیمات پیشرفته باز شود.")
 
 
 @dp.message(F.video | F.document)
@@ -154,7 +151,7 @@ async def handle_video(message: types.Message):
         return await message.answer("⚠️ لطفاً فقط فایل ویدیویی ارسال کنید.")
 
     if video.file_size > MAX_FILE_SIZE:
-        return await message.answer(f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف ۲ گیگابایت بیشتر است.")
+        return await message.answer(f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف مجاز (۲ گیگابایت) بیشتر است.")
 
     default_cfg = {
         "mode": "video",
@@ -201,7 +198,7 @@ async def stop_processing(callback: types.CallbackQuery):
             except ProcessLookupError:
                 pass
         await callback.answer("عملیات متوقف شد.")
-        await callback.message.edit_text("🛑 پردازش متوقف شد.")
+        await callback.message.edit_text("🛑 پردازش توسط شما متوقف شد.")
     else:
         await callback.answer("پردازش در حال حاضر فعال نیست.", show_alert=True)
 
@@ -280,25 +277,30 @@ async def process_job(job: dict):
     ext = "mp3" if mode == "mp3" else "mp4"
     output_path = os.path.join(DOWNLOAD_DIR, f"out_{job_id}.{ext}")
 
-    # مانیتور دانلود زنده از طریق MTProto
-    last_ui_update = 0.0
+    last_download_update = 0.0
+    last_dl_percent = -1
+
     async def download_progress(current, total):
-        nonlocal last_ui_update
-        if time.time() - last_ui_update > 2.5:
-            percent = (current / total) * 100.0 if total > 0 else 0.0
+        nonlocal last_download_update, last_dl_percent
+        if total <= 0:
+            return
+        percent = int((current / total) * 100.0)
+        now = time.time()
+        if now - last_download_update >= 3.5 and percent > last_dl_percent + 4:
             try:
                 await status_msg.edit_text(
-                    f"📥 در حال دریافت فایل (MTProto):\n{generate_progress_bar(percent)}",
+                    f"📥 در حال دریافت فایل:\n{generate_progress_bar(percent)}",
                     reply_markup=get_cancel_keyboard(job_id)
                 )
-                last_ui_update = time.time()
+                last_download_update = now
+                last_dl_percent = percent
             except (TelegramBadRequest, TelegramRetryAfter):
+                pass
+            except Exception:
                 pass
 
     try:
-        await status_msg.edit_text("📥 اتصال به شبکه تلگرام جهت دانلود...", reply_markup=get_cancel_keyboard(job_id))
-        
-        # دریافت پیام مرجع از طریق Pyrogram جهت دانلود بدون محدودیت ۲۰ مگابایت
+        await status_msg.edit_text("📥 اتصال جهت دانلود...", reply_markup=get_cancel_keyboard(job_id))
         target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
         await target_pyro_msg.download(
             file_name=input_path,
@@ -386,7 +388,7 @@ async def process_job(job: dict):
                 current_secs = float(match.group(1)) / 1_000_000.0
                 percent = min(100.0, (current_secs / effective_duration) * 100.0)
 
-                if time.time() - last_update > 2.5:
+                if time.time() - last_update > 3.0:
                     try:
                         await status_msg.edit_text(
                             f"⚙️ در حال پردازش ({mode}):\n{generate_progress_bar(percent)}",
@@ -394,6 +396,8 @@ async def process_job(job: dict):
                         )
                         last_update = time.time()
                     except (TelegramBadRequest, TelegramRetryAfter):
+                        pass
+                    except Exception:
                         pass
 
         await process.wait()
@@ -407,21 +411,30 @@ async def process_job(job: dict):
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        # مانیتور آپلود زنده
+        # مانیتور آپلود پایدار بدون اسپم به تلگرام
         last_upload_update = 0.0
+        last_up_percent = -1
+
         async def upload_progress(current, total):
-            nonlocal last_upload_update
-            if time.time() - last_upload_update > 2.5:
-                percent = (current / total) * 100.0 if total > 0 else 0.0
+            nonlocal last_upload_update, last_up_percent
+            if total <= 0:
+                return
+            percent = int((current / total) * 100.0)
+            now = time.time()
+            if now - last_upload_update >= 4.0 and percent > last_up_percent + 4:
                 try:
-                    await status_msg.edit_text(f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(percent)}")
-                    last_upload_update = time.time()
+                    await status_msg.edit_text(
+                        f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(percent)}"
+                    )
+                    last_upload_update = now
+                    last_up_percent = percent
                 except (TelegramBadRequest, TelegramRetryAfter):
+                    pass
+                except Exception:
                     pass
 
         await status_msg.edit_text("📤 در حال ارسال به تلگرام...")
 
-        # ارسال فایل‌های حجیم (تا ۲ گیگابایت) توسط Pyrogram
         if mode == "mp3":
             caption_text = (
                 "✅ پردازش با موفقیت انجام شد\n\n"
@@ -447,6 +460,7 @@ async def process_job(job: dict):
                 chat_id=job["chat_id"],
                 animation=output_path,
                 caption=caption_text,
+                unsave=True,
                 progress=upload_progress
             )
 
@@ -467,7 +481,6 @@ async def process_job(job: dict):
 
         await status_msg.delete()
 
-        # ارسال لاگ به ادمین
         if ADMIN_ID and job["user"].id != ADMIN_ID:
             u = job["user"]
             u_name = f"@{u.username}" if u.username else "ندارد"
@@ -493,10 +506,9 @@ async def process_job(job: dict):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # استارت همزمان کلاینت MTProto پایروگرام
     await pyro.start()
     asyncio.create_task(queue_worker())
-    logging.info("ربات MTProto قدرتمند فعال شد (سقف ۲ گیگابایت).")
+    logging.info("ربات با موتور MTProto و کلاینت بهینه‌شده با موفقیت فعال شد.")
     try:
         await dp.start_polling(bot)
     finally:
