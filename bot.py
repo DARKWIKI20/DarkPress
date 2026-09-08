@@ -26,12 +26,12 @@ MAX_FILE_SIZE = 2000 * 1024 * 1024
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# حالت in_memory حذف شد تا نشست ذخیره شده و جلوی قطع شدن‌ها را بگیرد
 pyro = PyroClient(
     name="bot_engine",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
+    bot_token=BOT_TOKEN
 )
 
 DOWNLOAD_DIR = "downloads"
@@ -264,37 +264,43 @@ async def queue_worker():
             JOB_QUEUE.task_done()
 
 
-# سیستم یکپارچه گرافیکی و ضد-بلاک
-async def update_ui(state: dict):
-    now = time.time()
-    if now - state["last_update"] < 3.0:
-        return
-    
-    state["last_update"] = now
-    percent = min(100.0, max(0.0, state["percent"]))
-    bar = generate_progress_bar(percent)
-    
-    if state["action"] == "download":
-        text = f"📥 در حال دریافت فایل:\n{bar}"
-    elif state["action"] == "encode":
-        text = f"⚙️ در حال پردازش:\n{bar}"
-    elif state["action"] == "upload":
-        text = f"📤 در حال ارسال به تلگرام:\n{bar}"
-    else:
-        text = "⏳ لطفا صبر کنید..."
+# --- سیستم آپدیت مستقل گرافیکی ---
+async def ui_updater_task(state: dict):
+    last_text = ""
+    while not state.get("done", False):
+        try:
+            percent = min(100.0, max(0.0, state.get("percent", 0.0)))
+            bar = generate_progress_bar(percent)
+            
+            action = state.get("action", "")
+            if action == "download":
+                text = f"📥 در حال دریافت فایل:\n{bar}"
+            elif action == "encode":
+                text = f"⚙️ در حال پردازش:\n{bar}"
+            elif action == "upload":
+                text = f"📤 در حال ارسال به تلگرام:\n{bar}"
+            else:
+                text = "⏳ لطفا صبر کنید..."
 
-    try:
-        await state["status_msg"].edit_text(text, reply_markup=get_cancel_keyboard(state["job_id"]))
-    except (TelegramBadRequest, TelegramRetryAfter):
-        pass
-    except Exception:
-        pass
+            if text != last_text:
+                await state["status_msg"].edit_text(text, reply_markup=get_cancel_keyboard(state["job_id"]))
+                last_text = text
+                
+        except (TelegramBadRequest, TelegramRetryAfter):
+            pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+        
+        # وقفه ۳.۵ ثانیه‌ای مطلق برای فرار از قطعی سرور
+        await asyncio.sleep(3.5)
 
 
-async def py_progress_callback(current, total, state):
+# کالبک خام (Sync) که هرگز موتور تلگرام را معطل نمی‌کند
+def py_progress_callback(current, total, state):
     if total > 0:
         state["percent"] = (current / total) * 100.0
-        await update_ui(state)
 
 
 async def process_job(job: dict):
@@ -314,15 +320,15 @@ async def process_job(job: dict):
         "job_id": job_id,
         "action": "download",
         "percent": 0.0,
-        "last_update": 0.0
+        "done": False
     }
+    
+    ui_task = asyncio.create_task(ui_updater_task(ui_state))
 
     try:
-        await update_ui(ui_state)
-        
         target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
         
-        # مرحله دانلود
+        # مرحله ۱: دانلود
         await target_pyro_msg.download(
             file_name=input_path,
             progress=py_progress_callback,
@@ -335,10 +341,9 @@ async def process_job(job: dict):
         total_duration = await get_video_duration(input_path)
         effective_duration = total_duration / speed_factor if speed_factor > 0 else total_duration
 
+        # مرحله ۲: انکودینگ
         ui_state["action"] = "encode"
         ui_state["percent"] = 0.0
-        ui_state["last_update"] = 0.0
-        await update_ui(ui_state)
 
         cmd = [FFMPEG_BIN, "-y", "-i", input_path]
 
@@ -396,7 +401,6 @@ async def process_job(job: dict):
             if match and effective_duration > 0 and not ACTIVE_PROCESSES[job_id]["cancelled"]:
                 current_secs = float(match.group(1)) / 1_000_000.0
                 ui_state["percent"] = (current_secs / effective_duration) * 100.0
-                await update_ui(ui_state)
 
         await process.wait()
 
@@ -409,14 +413,9 @@ async def process_job(job: dict):
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        # مرحله آپلود
+        # مرحله ۳: آپلود
         ui_state["action"] = "upload"
         ui_state["percent"] = 0.0
-        ui_state["last_update"] = 0.0
-        await update_ui(ui_state)
-        
-        # استراحت کوتاه برای اطمینان از بسته شدن هندلرهای فایل قبل از آپلود
-        await asyncio.sleep(1)
 
         if mode == "mp3":
             caption_text = (
@@ -465,6 +464,9 @@ async def process_job(job: dict):
                 progress_args=(ui_state,)
             )
 
+        # پایان پردازش
+        ui_state["done"] = True
+        ui_task.cancel()
         await status_msg.delete()
 
         if ADMIN_ID and job["user"].id != ADMIN_ID:
@@ -482,6 +484,10 @@ async def process_job(job: dict):
                 pass
 
     finally:
+        ui_state["done"] = True
+        if not ui_task.done():
+            ui_task.cancel()
+            
         for p in (input_path, output_path):
             if os.path.exists(p):
                 try:
@@ -494,7 +500,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await pyro.start()
     asyncio.create_task(queue_worker())
-    logging.info("ربات با موتور MTProto و کلاینت بهینه‌شده با موفقیت فعال شد.")
+    logging.info("ربات به همراه پروگرس‌بار کاملاً مستقل فعال شد.")
     try:
         await dp.start_polling(bot)
     finally:
