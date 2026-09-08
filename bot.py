@@ -26,7 +26,6 @@ MAX_FILE_SIZE = 2000 * 1024 * 1024
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# حالت in_memory حذف شد تا نشست ذخیره شده و جلوی قطع شدن‌ها را بگیرد
 pyro = PyroClient(
     name="bot_engine",
     api_id=API_ID,
@@ -197,7 +196,7 @@ async def stop_processing(callback: types.CallbackQuery):
             except ProcessLookupError:
                 pass
         await callback.answer("عملیات متوقف شد.")
-        await callback.message.edit_text("🛑 پردازش لغو شد.")
+        await callback.message.edit_text("🛑 پردازش توسط شما لغو شد.")
     else:
         await callback.answer("پردازشی فعال نیست.", show_alert=True)
 
@@ -264,7 +263,7 @@ async def queue_worker():
             JOB_QUEUE.task_done()
 
 
-# --- سیستم آپدیت مستقل گرافیکی ---
+# --- سیستم آپدیت مستقل گرافیکی با مدیریت دقیق FloodWait ---
 async def ui_updater_task(state: dict):
     last_text = ""
     while not state.get("done", False):
@@ -286,19 +285,28 @@ async def ui_updater_task(state: dict):
                 await state["status_msg"].edit_text(text, reply_markup=get_cancel_keyboard(state["job_id"]))
                 last_text = text
                 
-        except (TelegramBadRequest, TelegramRetryAfter):
+        except TelegramRetryAfter as e:
+            # مهم‌ترین بخش: اگر تلگرام لیمیت کرد، دقیقاً به همون اندازه منتظر می‌مانیم
+            logging.warning(f"FloodWait hit! Sleeping for {e.retry_after} seconds...")
+            await asyncio.sleep(e.retry_after)
+            continue
+        except TelegramBadRequest as e:
             pass
         except asyncio.CancelledError:
             break
         except Exception:
             pass
         
-        # وقفه ۳.۵ ثانیه‌ای مطلق برای فرار از قطعی سرور
-        await asyncio.sleep(3.5)
+        # استراحت ۴ ثانیه‌ای بین آپدیت‌ها برای حفظ ارتباط پایدار
+        await asyncio.sleep(4.0)
 
 
-# کالبک خام (Sync) که هرگز موتور تلگرام را معطل نمی‌کند
-def py_progress_callback(current, total, state):
+# کالبک کاملاً Async و پشتیبانی از قطع شدن توسط کاربر
+async def py_progress_callback(current, total, state):
+    job_id = state.get("job_id")
+    if ACTIVE_PROCESSES.get(job_id, {}).get("cancelled"):
+        raise asyncio.CancelledError("User cancelled operation")
+        
     if total > 0:
         state["percent"] = (current / total) * 100.0
 
@@ -329,11 +337,14 @@ async def process_job(job: dict):
         target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
         
         # مرحله ۱: دانلود
-        await target_pyro_msg.download(
-            file_name=input_path,
-            progress=py_progress_callback,
-            progress_args=(ui_state,)
-        )
+        try:
+            await target_pyro_msg.download(
+                file_name=input_path,
+                progress=py_progress_callback,
+                progress_args=(ui_state,)
+            )
+        except asyncio.CancelledError:
+            return
 
         if ACTIVE_PROCESSES[job_id]["cancelled"]:
             return
@@ -417,52 +428,55 @@ async def process_job(job: dict):
         ui_state["action"] = "upload"
         ui_state["percent"] = 0.0
 
-        if mode == "mp3":
-            caption_text = (
-                "✅ پردازش انجام شد\n\n"
-                f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
-                f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                f"⚡ فشرده‌سازی: {reduction}% کاهش (فرمت MP3)"
-            )
-            await pyro.send_audio(
-                chat_id=job["chat_id"],
-                audio=output_path,
-                caption=caption_text,
-                progress=py_progress_callback,
-                progress_args=(ui_state,)
-            )
+        try:
+            if mode == "mp3":
+                caption_text = (
+                    "✅ پردازش انجام شد\n\n"
+                    f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
+                    f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
+                    f"⚡ فشرده‌سازی: {reduction}% کاهش (فرمت MP3)"
+                )
+                await pyro.send_audio(
+                    chat_id=job["chat_id"],
+                    audio=output_path,
+                    caption=caption_text,
+                    progress=py_progress_callback,
+                    progress_args=(ui_state,)
+                )
 
-        elif mode == "gif":
-            caption_text = (
-                "✅ پردازش انجام شد\n\n"
-                f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
-                f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
-            )
-            await pyro.send_animation(
-                chat_id=job["chat_id"],
-                animation=output_path,
-                caption=caption_text,
-                unsave=True,
-                progress=py_progress_callback,
-                progress_args=(ui_state,)
-            )
+            elif mode == "gif":
+                caption_text = (
+                    "✅ پردازش انجام شد\n\n"
+                    f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
+                    f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
+                    f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
+                )
+                await pyro.send_animation(
+                    chat_id=job["chat_id"],
+                    animation=output_path,
+                    caption=caption_text,
+                    unsave=True,
+                    progress=py_progress_callback,
+                    progress_args=(ui_state,)
+                )
 
-        else:
-            caption_text = (
-                "✅ پردازش انجام شد\n\n"
-                f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
-                f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
-                f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
-            )
-            await pyro.send_video(
-                chat_id=job["chat_id"],
-                video=output_path,
-                caption=caption_text,
-                supports_streaming=True,
-                progress=py_progress_callback,
-                progress_args=(ui_state,)
-            )
+            else:
+                caption_text = (
+                    "✅ پردازش انجام شد\n\n"
+                    f"📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n"
+                    f"📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n"
+                    f"⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
+                )
+                await pyro.send_video(
+                    chat_id=job["chat_id"],
+                    video=output_path,
+                    caption=caption_text,
+                    supports_streaming=True,
+                    progress=py_progress_callback,
+                    progress_args=(ui_state,)
+                )
+        except asyncio.CancelledError:
+            return
 
         # پایان پردازش
         ui_state["done"] = True
@@ -500,7 +514,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await pyro.start()
     asyncio.create_task(queue_worker())
-    logging.info("ربات به همراه پروگرس‌بار کاملاً مستقل فعال شد.")
+    logging.info("ربات بدون مشکل FloodWait فعال شد.")
     try:
         await dp.start_polling(bot)
     finally:
