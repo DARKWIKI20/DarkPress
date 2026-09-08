@@ -264,6 +264,42 @@ async def queue_worker():
             JOB_QUEUE.task_done()
 
 
+# --- Worker ایزوله برای آپدیت گرافیکی (جلوگیری از مسدود شدن آپلود) ---
+async def ui_updater_task(status_msg, state, job_id):
+    last_text = ""
+    while not state.get("done"):
+        try:
+            action = state.get("action")
+            current = state.get("current", 0)
+            total = state.get("total", 1)
+            
+            percent = (current / total) * 100.0 if total > 0 else 0.0
+            percent = min(100.0, max(0.0, percent))
+            
+            if action == "download":
+                text = f"📥 در حال دریافت فایل:\n{generate_progress_bar(percent)}"
+            elif action == "encode":
+                text = f"⚙️ در حال پردازش:\n{generate_progress_bar(percent)}"
+            elif action == "upload":
+                text = f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(percent)}"
+            else:
+                text = "⏳ در حال آماده‌سازی..."
+                
+            if text != last_text:
+                await status_msg.edit_text(text, reply_markup=get_cancel_keyboard(job_id))
+                last_text = text
+                
+        except asyncio.CancelledError:
+            break
+        except (TelegramBadRequest, TelegramRetryAfter):
+            pass
+        except Exception:
+            pass
+        
+        # استراحت ۳.۵ ثانیه‌ای مطلق برای جلوگیری از FloodWait
+        await asyncio.sleep(3.5)
+
+
 async def process_job(job: dict):
     job_id = job["job_id"]
     cfg = job["cfg"]
@@ -276,24 +312,17 @@ async def process_job(job: dict):
     ext = "mp3" if mode == "mp3" else "mp4"
     output_path = os.path.join(DOWNLOAD_DIR, f"out_{job_id}.{ext}")
 
-    # سیستم به‌روزرسانی بدون وقفه UI برای دانلود
-    last_dl_time = 0.0
-    async def download_progress(current, total):
-        nonlocal last_dl_time
-        now = time.time()
-        if now - last_dl_time >= 3.0 and total > 0:
-            last_dl_time = now
-            percent = (current / total) * 100.0
-            try:
-                await status_msg.edit_text(
-                    f"📥 در حال دریافت فایل:\n{generate_progress_bar(percent)}",
-                    reply_markup=get_cancel_keyboard(job_id)
-                )
-            except Exception:
-                pass
+    # استیت ماشین پیشرفت کار
+    ui_state = {"action": "init", "current": 0, "total": 1, "done": False}
+    ui_task = asyncio.create_task(ui_updater_task(status_msg, ui_state, job_id))
 
     try:
-        await status_msg.edit_text("📥 در حال دریافت فایل...", reply_markup=get_cancel_keyboard(job_id))
+        ui_state["action"] = "download"
+        
+        async def download_progress(current, total):
+            ui_state["current"] = current
+            ui_state["total"] = total
+
         target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
         await target_pyro_msg.download(
             file_name=input_path,
@@ -306,7 +335,9 @@ async def process_job(job: dict):
         total_duration = await get_video_duration(input_path)
         effective_duration = total_duration / speed_factor if speed_factor > 0 else total_duration
 
-        await status_msg.edit_text("⚙️ در حال آماده‌سازی و انکود...", reply_markup=get_cancel_keyboard(job_id))
+        ui_state["action"] = "encode"
+        ui_state["current"] = 0
+        ui_state["total"] = effective_duration
 
         cmd = [FFMPEG_BIN, "-y", "-i", input_path]
 
@@ -366,8 +397,6 @@ async def process_job(job: dict):
             *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
         ACTIVE_PROCESSES[job_id]["proc"] = process
-
-        last_update = 0.0
         time_pattern = re.compile(r"out_time_us=(\d+)")
 
         while True:
@@ -375,21 +404,10 @@ async def process_job(job: dict):
             if not line:
                 break
             line_str = line.decode(errors="ignore").strip()
-
             match = time_pattern.search(line_str)
             if match and effective_duration > 0 and not ACTIVE_PROCESSES[job_id]["cancelled"]:
                 current_secs = float(match.group(1)) / 1_000_000.0
-                percent = min(100.0, (current_secs / effective_duration) * 100.0)
-
-                if time.time() - last_update > 3.0:
-                    try:
-                        await status_msg.edit_text(
-                            f"⚙️ در حال پردازش ({mode}):\n{generate_progress_bar(percent)}",
-                            reply_markup=get_cancel_keyboard(job_id)
-                        )
-                        last_update = time.time()
-                    except Exception:
-                        pass
+                ui_state["current"] = current_secs
 
         await process.wait()
 
@@ -397,35 +415,21 @@ async def process_job(job: dict):
             return
 
         if process.returncode != 0 or not os.path.exists(output_path):
+            ui_state["done"] = True
+            ui_task.cancel()
             return await status_msg.edit_text("❌ پردازش فایل با خطا مواجه شد.")
 
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        # سیستم آپلود آسنکرون اختصاصی (کاملاً ایزوله تا آپلود بلاک نشود)
-        upload_ui_lock = False
-        last_up_time = 0.0
+        ui_state["action"] = "upload"
+        ui_state["current"] = 0
+        ui_state["total"] = final_size
 
-        async def _safe_edit_progress(pct: float):
-            nonlocal upload_ui_lock
-            try:
-                await status_msg.edit_text(f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(pct)}")
-            except Exception:
-                pass
-            finally:
-                upload_ui_lock = False
-
-        def upload_progress(current, total):
-            nonlocal last_up_time, upload_ui_lock
-            now = time.time()
-            if now - last_up_time >= 3.0 and not upload_ui_lock and total > 0:
-                last_up_time = now
-                upload_ui_lock = True
-                pct = (current / total) * 100.0
-                # فراخوانی به شکل تسک مستقل تا سرعت ارسال افت نکند
-                asyncio.create_task(_safe_edit_progress(pct))
-
-        await status_msg.edit_text("📤 در حال شروع ارسال به تلگرام...")
+        async def upload_progress(current, total):
+            # این تابع حالا کاملا سبک است و جلوی آپلود را نمی‌گیرد
+            ui_state["current"] = current
+            ui_state["total"] = total
 
         if mode == "mp3":
             caption_text = (
@@ -471,6 +475,8 @@ async def process_job(job: dict):
                 progress=upload_progress
             )
 
+        ui_state["done"] = True
+        ui_task.cancel()
         await status_msg.delete()
 
         if ADMIN_ID and job["user"].id != ADMIN_ID:
@@ -488,6 +494,10 @@ async def process_job(job: dict):
                 pass
 
     finally:
+        ui_state["done"] = True
+        if not ui_task.done():
+            ui_task.cancel()
+            
         for p in (input_path, output_path):
             if os.path.exists(p):
                 try:
