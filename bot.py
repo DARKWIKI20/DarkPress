@@ -265,7 +265,6 @@ async def queue_worker():
             JOB_QUEUE.task_done()
 
 
-# رابط کاربری ضد بلاک و مستقل
 async def ui_updater_task(state: dict):
     last_text = ""
     while not state.get("done", False):
@@ -300,7 +299,6 @@ async def ui_updater_task(state: dict):
         await asyncio.sleep(3.5)
 
 
-# تبدیل شدن کالبک به حالت Sync تا جلوی استریم فایل در Pyrogram را نگیرد
 def py_progress_callback(current, total, state):
     if total > 0:
         state["percent"] = (current / total) * 100.0
@@ -329,15 +327,12 @@ async def process_job(job: dict):
     ui_task = asyncio.create_task(ui_updater_task(ui_state))
 
     try:
-        # مرحله ۱: دانلود هوشمند (ترافیک کم با Aiogram، ترافیک بالا با Pyrogram)
         if initial_size < 19.5 * 1024 * 1024:
-            # دانلود سریع فایل‌های زیر ۲۰ مگابایت با HTTP پایدار
-            ui_state["percent"] = 50.0 # نمایش حدودی پیشرفت
+            ui_state["percent"] = 50.0
             file_info = await bot.get_file(job["file_id"])
             await bot.download_file(file_info.file_path, destination=input_path)
             ui_state["percent"] = 100.0
         else:
-            # دانلود فایل‌های سنگین با MTProto
             target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
             await target_pyro_msg.download(
                 file_name=input_path,
@@ -351,11 +346,15 @@ async def process_job(job: dict):
         total_duration = await get_video_duration(input_path)
         effective_duration = total_duration / speed_factor if speed_factor > 0 else total_duration
 
-        # مرحله ۲: انکودینگ
         ui_state["action"] = "encode"
         ui_state["percent"] = 0.0
 
-        cmd = [FFMPEG_BIN, "-y", "-i", input_path]
+        # بهینه سازی FFmpeg جهت جلوگیری از کرش رم (OOM)
+        cmd = [
+            FFMPEG_BIN, "-y", "-i", input_path,
+            "-threads", "2", 
+            "-max_muxing_queue_size", "1024"
+        ]
 
         if mode == "mp3":
             cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", "192k", output_path]
@@ -365,7 +364,7 @@ async def process_job(job: dict):
                 vf_chains.append(f"setpts={1.0 / speed_factor}*PTS")
             vf_chains.append("fps=15")
             vf_chains.append("scale=480:-2")
-            cmd += ["-an", "-c:v", "libx264", "-vf", ",".join(vf_chains), "-crf", "26", "-preset", "faster", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-progress", "pipe:2", output_path]
+            cmd += ["-an", "-c:v", "libx264", "-vf", ",".join(vf_chains), "-crf", "28", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-progress", "pipe:2", output_path]
         else:
             crf_map = {"light": "23", "medium": "28", "heavy": "34"}
             v_codec = "libx265" if cfg["codec"] == "h265" else "libx264"
@@ -374,7 +373,8 @@ async def process_job(job: dict):
             if speed_factor != 1.0:
                 vf_chains.append(f"setpts={1.0 / speed_factor}*PTS")
             vf_chains.append(scale_filter)
-            cmd += ["-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains), "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "faster", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            
+            cmd += ["-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains), "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
             if cfg["mute"]:
                 cmd += ["-an"]
             else:
@@ -409,13 +409,11 @@ async def process_job(job: dict):
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        # مرحله ۳: آپلود هوشمند (جلوگیری قطعی از فریز شدن فایل‌های کوچک)
         if mode == "mp3":
             caption_text = f"✅ پردازش انجام شد\n\n📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n⚡ فشرده‌سازی: {reduction}% کاهش (فرمت MP3)"
         else:
             caption_text = f"✅ پردازش انجام شد\n\n📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
 
-        # اگر فایل خروجی کمتر از 49.5 مگابایت باشد، برای سرعت و ثبات ۱۰۰٪ با موتور Aiogram HTTP ارسال می‌شود
         if final_size < 49.5 * 1024 * 1024:
             ui_state["action"] = "upload_http"
             ui_state["percent"] = 75.0
@@ -430,7 +428,6 @@ async def process_job(job: dict):
             ui_state["percent"] = 100.0
             
         else:
-            # فقط فایل‌های حجیم که Aiogram نمی‌تواند آپلود کند به موتور Pyrogram سپرده می‌شوند
             ui_state["action"] = "upload_pyro"
             ui_state["percent"] = 0.0
             
