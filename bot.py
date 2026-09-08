@@ -327,7 +327,6 @@ async def process_job(job: dict):
     ui_task = asyncio.create_task(ui_updater_task(ui_state))
 
     try:
-        # مدیریت دانلود یکپارچه بین فایل های کوچک و بزرگ
         if initial_size < 19.5 * 1024 * 1024:
             ui_state["percent"] = 50.0
             file_info = await bot.get_file(job["file_id"])
@@ -350,10 +349,10 @@ async def process_job(job: dict):
         ui_state["action"] = "encode"
         ui_state["percent"] = 0.0
 
-        # بهینه سازی محدودیت منابع برای جلوگیری از Exit Code 137 در Railway
+        # تنظیمات بهینه FFmpeg ضد کرش و سازگار با انواع استریم‌های صوتی و تصویری
         cmd = [
             FFMPEG_BIN, "-y", "-i", input_path,
-            "-threads", "2", 
+            "-threads", "2",
             "-max_muxing_queue_size", "1024"
         ]
 
@@ -365,26 +364,39 @@ async def process_job(job: dict):
                 vf_chains.append(f"setpts={1.0 / speed_factor}*PTS")
             vf_chains.append("fps=15")
             vf_chains.append("scale=480:-2")
-            cmd += ["-an", "-c:v", "libx264", "-vf", ",".join(vf_chains), "-crf", "28", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-progress", "pipe:2", output_path]
+            cmd += [
+                "-an", "-c:v", "libx264", "-vf", ",".join(vf_chains),
+                "-crf", "28", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", "-progress", "pipe:2", output_path
+            ]
         else:
             crf_map = {"light": "23", "medium": "28", "heavy": "34"}
             v_codec = "libx265" if cfg["codec"] == "h265" else "libx264"
             scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2" if cfg["res"] == "orig" else f"scale=-2:{cfg['res']}"
+            
             vf_chains = []
             if speed_factor != 1.0:
                 vf_chains.append(f"setpts={1.0 / speed_factor}*PTS")
             vf_chains.append(scale_filter)
             
-            cmd += ["-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains), "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            cmd += [
+                "-map", "0:v:0", "-c:v", v_codec, "-vf", ",".join(vf_chains),
+                "-crf", crf_map.get(cfg["crf"], "28"), "-preset", "veryfast",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart"
+            ]
             if cfg["mute"]:
                 cmd += ["-an"]
             else:
-                cmd += ["-map", "0:a:0?"]
+                cmd += [
+                    "-map", "0:a:0?",
+                    "-c:a", "aac", "-b:a", "128k", "-strict", "experimental"
+                ]
                 if speed_factor != 1.0:
                     cmd += ["-filter:a", f"atempo={speed_factor}"]
-                cmd += ["-c:a", "aac", "-b:a", "128k"]
+
             cmd += ["-progress", "pipe:2", output_path]
 
+        error_lines = []
         process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         ACTIVE_PROCESSES[job_id]["proc"] = process
         time_pattern = re.compile(r"out_time_us=(\d+)")
@@ -394,6 +406,11 @@ async def process_job(job: dict):
             if not line:
                 break
             line_str = line.decode(errors="ignore").strip()
+            if line_str:
+                error_lines.append(line_str)
+                if len(error_lines) > 25:
+                    error_lines.pop(0)
+
             match = time_pattern.search(line_str)
             if match and effective_duration > 0 and not ACTIVE_PROCESSES[job_id]["cancelled"]:
                 current_secs = float(match.group(1)) / 1_000_000.0
@@ -404,8 +421,17 @@ async def process_job(job: dict):
         if ACTIVE_PROCESSES[job_id]["cancelled"]:
             return
 
+        # بررسی خطای FFmpeg با گزارش علت در کنسول و پیام به کاربر
         if process.returncode != 0 or not os.path.exists(output_path):
-            return await status_msg.edit_text("❌ پردازش فایل با خطا مواجه شد.")
+            detailed_err = "\n".join(error_lines[-10:]) if error_lines else "بدون لاگ خروجی"
+            logging.error(f"FFmpeg Failed (Exit Code {process.returncode}):\n{detailed_err}")
+            ui_state["done"] = True
+            ui_task.cancel()
+            return await status_msg.edit_text(
+                f"❌ پردازش فایل با خطا مواجه شد.\n\n"
+                f"کد خطا: `{process.returncode}`\n"
+                f"⚠️ در صورت کد ۱۳۷ یا ۹، حافظه رم سرور پر شده است (ابعاد را کاهش دهید)."
+            )
 
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
@@ -415,7 +441,6 @@ async def process_job(job: dict):
         else:
             caption_text = f"✅ پردازش انجام شد\n\n📦 حجم اولیه: {initial_size / (1024*1024):.2f} MB\n📉 حجم نهایی: {final_size / (1024*1024):.2f} MB\n⚡ فشرده‌سازی: {reduction}% کاهش (سرعت {speed_factor}x)"
 
-        # تفکیک آپلود براساس حجم برای افزایش پایداری شبکه
         if final_size < 49.5 * 1024 * 1024:
             ui_state["action"] = "upload_http"
             ui_state["percent"] = 75.0
@@ -470,13 +495,13 @@ async def start_pyrogram_safely():
     while True:
         try:
             await pyro.start()
-            logging.info("✅ موتور قدرتمند Pyrogram متصل شد.")
+            logging.info("✅ کلاینت Pyrogram با موفقیت متصل شد.")
             break
         except Exception as e:
             if "FLOOD_WAIT" in str(e).upper():
                 match = re.search(r'\d+', str(e))
                 wait_time = int(match.group()) if match else 60
-                logging.warning(f"⚠️ محدودیت ورود Pyrogram. ربات اصلی کار میکند اما دانلود فایل حجیم {wait_time} ثانیه دیگر فعال میشود...")
+                logging.warning(f"⚠️ محدودیت لاگین Pyrogram: {wait_time} ثانیه انتظار...")
                 await asyncio.sleep(wait_time + 1)
             else:
                 logging.error(f"خطا در اتصال Pyrogram: {e}")
@@ -484,20 +509,19 @@ async def start_pyrogram_safely():
 
 
 async def main():
-    # استارت کردن Pyrogram در بک‌گراند 
     asyncio.create_task(start_pyrogram_safely())
     asyncio.create_task(queue_worker())
     
-    logging.info("✅ موتور اصلی ربات (Aiogram) فعال شد. ربات هم‌اکنون در تلگرام پاسخگو است.")
+    logging.info("✅ ربات تلگرام با موفقیت فعال شد و پاسخگوی پیام‌هاست.")
     
     try:
-        # حذف کردن متد قبلی delete_webhook و استفاده از پارامتر در زمان استارت برای جلوگیری از بن شدن سرور
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         try:
             await pyro.stop()
-        except:
+        except Exception:
             pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())
