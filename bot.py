@@ -16,7 +16,6 @@ FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# مقادیر احراز هویت
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8812733722:AAEFW8oxPPQYyqrqHGtnvS8fTpu3ATxcDbo")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6616272875"))
 API_ID = int(os.getenv("API_ID", "26202905"))
@@ -136,7 +135,7 @@ def get_cancel_keyboard(job_id: str):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("🎬 ویدیوی خود را ارسال کنید تا پنل تنظیمات پیشرفته باز شود.")
+    await message.answer("🎬 ویدیوی خود را بفرستید تا پنل تنظیمات باز شود.")
 
 
 @dp.message(F.video | F.document)
@@ -151,7 +150,7 @@ async def handle_video(message: types.Message):
         return await message.answer("⚠️ لطفاً فقط فایل ویدیویی ارسال کنید.")
 
     if video.file_size > MAX_FILE_SIZE:
-        return await message.answer(f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف مجاز (۲ گیگابایت) بیشتر است.")
+        return await message.answer(f"❌ حجم فایل ({video.file_size / (1024*1024):.1f} MB) از سقف ۲ گیگابایت بیشتر است.")
 
     default_cfg = {
         "mode": "video",
@@ -198,9 +197,9 @@ async def stop_processing(callback: types.CallbackQuery):
             except ProcessLookupError:
                 pass
         await callback.answer("عملیات متوقف شد.")
-        await callback.message.edit_text("🛑 پردازش توسط شما متوقف شد.")
+        await callback.message.edit_text("🛑 پردازش لغو شد.")
     else:
-        await callback.answer("پردازش در حال حاضر فعال نیست.", show_alert=True)
+        await callback.answer("پردازشی فعال نیست.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("run:"))
@@ -211,7 +210,7 @@ async def enqueue_task(callback: types.CallbackQuery):
 
     orig_msg = callback.message.reply_to_message
     if not orig_msg:
-        return await callback.message.edit_text("❌ ویدیوی مرجع یافت نشد. لطفاً ویدیو را مجدداً ارسال کنید.")
+        return await callback.message.edit_text("❌ ویدیوی مرجع یافت نشد. مجدداً ویدیو را ارسال کنید.")
 
     video = orig_msg.video or (
         orig_msg.document
@@ -220,12 +219,12 @@ async def enqueue_task(callback: types.CallbackQuery):
     )
 
     if not video:
-        return await callback.message.edit_text("❌ فایل ویدیویی یافت نشد. لطفاً ویدیو را دوباره بفرستید.")
+        return await callback.message.edit_text("❌ ویدیویی یافت نشد.")
 
     job_id = f"{callback.message.chat.id}_{callback.message.message_id}"
 
     status_msg = await callback.message.edit_text(
-        f"⏳ در صف انتظار سرور قرار گرفتید...\n👥 نوبت شما: **نفر {JOB_QUEUE.qsize() + 1}**",
+        f"⏳ در صف انتظار...\n👥 نوبت شما: **نفر {JOB_QUEUE.qsize() + 1}**",
         reply_markup=get_cancel_keyboard(job_id)
     )
 
@@ -257,7 +256,7 @@ async def queue_worker():
         except Exception as e:
             logging.error(f"Error on job {job_id}: {e}", exc_info=True)
             try:
-                await job["status_msg"].edit_text("⚠️ خطایی در اجرای پردازش پیش آمد.")
+                await job["status_msg"].edit_text("⚠️ خطایی در اجرای پردازش رخ داد.")
             except Exception:
                 pass
         finally:
@@ -277,30 +276,24 @@ async def process_job(job: dict):
     ext = "mp3" if mode == "mp3" else "mp4"
     output_path = os.path.join(DOWNLOAD_DIR, f"out_{job_id}.{ext}")
 
-    last_download_update = 0.0
-    last_dl_percent = -1
-
+    # سیستم به‌روزرسانی بدون وقفه UI برای دانلود
+    last_dl_time = 0.0
     async def download_progress(current, total):
-        nonlocal last_download_update, last_dl_percent
-        if total <= 0:
-            return
-        percent = int((current / total) * 100.0)
+        nonlocal last_dl_time
         now = time.time()
-        if now - last_download_update >= 3.5 and percent > last_dl_percent + 4:
+        if now - last_dl_time >= 3.0 and total > 0:
+            last_dl_time = now
+            percent = (current / total) * 100.0
             try:
                 await status_msg.edit_text(
                     f"📥 در حال دریافت فایل:\n{generate_progress_bar(percent)}",
                     reply_markup=get_cancel_keyboard(job_id)
                 )
-                last_download_update = now
-                last_dl_percent = percent
-            except (TelegramBadRequest, TelegramRetryAfter):
-                pass
             except Exception:
                 pass
 
     try:
-        await status_msg.edit_text("📥 اتصال جهت دانلود...", reply_markup=get_cancel_keyboard(job_id))
+        await status_msg.edit_text("📥 در حال دریافت فایل...", reply_markup=get_cancel_keyboard(job_id))
         target_pyro_msg = await pyro.get_messages(chat_id=job["chat_id"], message_ids=job["msg_id"])
         await target_pyro_msg.download(
             file_name=input_path,
@@ -395,8 +388,6 @@ async def process_job(job: dict):
                             reply_markup=get_cancel_keyboard(job_id)
                         )
                         last_update = time.time()
-                    except (TelegramBadRequest, TelegramRetryAfter):
-                        pass
                     except Exception:
                         pass
 
@@ -411,29 +402,30 @@ async def process_job(job: dict):
         final_size = os.path.getsize(output_path)
         reduction = max(0, int(((initial_size - final_size) / initial_size) * 100))
 
-        # مانیتور آپلود پایدار بدون اسپم به تلگرام
-        last_upload_update = 0.0
-        last_up_percent = -1
+        # سیستم آپلود آسنکرون اختصاصی (کاملاً ایزوله تا آپلود بلاک نشود)
+        upload_ui_lock = False
+        last_up_time = 0.0
 
-        async def upload_progress(current, total):
-            nonlocal last_upload_update, last_up_percent
-            if total <= 0:
-                return
-            percent = int((current / total) * 100.0)
+        async def _safe_edit_progress(pct: float):
+            nonlocal upload_ui_lock
+            try:
+                await status_msg.edit_text(f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(pct)}")
+            except Exception:
+                pass
+            finally:
+                upload_ui_lock = False
+
+        def upload_progress(current, total):
+            nonlocal last_up_time, upload_ui_lock
             now = time.time()
-            if now - last_upload_update >= 4.0 and percent > last_up_percent + 4:
-                try:
-                    await status_msg.edit_text(
-                        f"📤 در حال ارسال به تلگرام:\n{generate_progress_bar(percent)}"
-                    )
-                    last_upload_update = now
-                    last_up_percent = percent
-                except (TelegramBadRequest, TelegramRetryAfter):
-                    pass
-                except Exception:
-                    pass
+            if now - last_up_time >= 3.0 and not upload_ui_lock and total > 0:
+                last_up_time = now
+                upload_ui_lock = True
+                pct = (current / total) * 100.0
+                # فراخوانی به شکل تسک مستقل تا سرعت ارسال افت نکند
+                asyncio.create_task(_safe_edit_progress(pct))
 
-        await status_msg.edit_text("📤 در حال ارسال به تلگرام...")
+        await status_msg.edit_text("📤 در حال شروع ارسال به تلگرام...")
 
         if mode == "mp3":
             caption_text = (
